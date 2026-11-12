@@ -1,0 +1,665 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Weighted Voronoi Foam</title>
+<style>
+  :root { --fg: #fff; --bg: #000; --panel: rgba(0,0,0,0.72); --line: rgba(255,255,255,0.35); }
+  body.day { --fg: #1b2433; --bg: #e8edf5; --panel: rgba(255,255,255,0.8); --line: rgba(27,36,51,0.3); }
+  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
+  body { font: 600 13px/1.3 "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg);
+         -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #title { position: fixed; left: 16px; top: max(16px, env(safe-area-inset-top)); pointer-events: none; }
+  #title h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.01em; }
+  #hint { margin-top: 4px; font-weight: 500; opacity: 0.7; transition: opacity 1.2s; }
+  #hint.gone { opacity: 0; }
+  #ui { position: fixed; right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); display: flex;
+        flex-direction: column; align-items: flex-end; gap: 8px; }
+  .row { display: flex; gap: 6px; }
+  button { font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line);
+           border-radius: 999px; padding: 0 14px; height: 36px; min-width: 44px; cursor: pointer;
+           -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+  button.on { background: var(--fg); color: var(--bg); }
+  #panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 6px 14px;
+           width: min(260px, calc(100vw - 32px)); box-sizing: border-box;
+           -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+  #panel[hidden] { display: none; }
+  #panel label { display: flex; align-items: center; justify-content: space-between; gap: 10px; height: 40px;
+                 border-bottom: 1px solid var(--line); }
+  #panel label:last-child { border-bottom: 0; }
+  #panel label > b { width: 62px; font-weight: inherit; }
+  #panel span.v { width: 36px; text-align: right; font-weight: 500; opacity: 0.75; }
+  input[type=range] { flex: 1; accent-color: currentColor; height: 40px; margin: 0; }
+  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
+         text-align: center; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="title">
+  <h1>Weighted Voronoi Foam</h1>
+  <div id="hint">tap: pop · hold: blow · drag: stir</div>
+</div>
+<div id="ui">
+  <div id="panel" hidden>
+    <label><b>Bubbles</b> <input id="sCount" type="range" min="50" max="1000" step="10"><span class="v" id="vCount"></span></label>
+    <label><b>Coarsen</b> <input id="sCoarsen" type="range" min="0" max="8" step="0.1"><span class="v" id="vCoarsen"></span></label>
+    <label><b>Bulge</b> <input id="sBulge" type="range" min="0" max="2" step="0.01"><span class="v" id="vBulge"></span></label>
+    <label><b>Line</b> <input id="sLine" type="range" min="0.5" max="8" step="0.05"><span class="v" id="vLine"></span></label>
+    <label><b>Volume</b> <input id="sVolume" type="range" min="0" max="1" step="0.01"><span class="v" id="vVolume"></span></label>
+  </div>
+  <div class="row">
+    <button id="bSound" class="on">Sound</button>
+    <button id="bLook">Day</button>
+    <button id="bReset">Reset</button>
+    <button id="bPanel">Edit</button>
+  </div>
+</div>
+<div id="err"></div>
+<script>
+'use strict';
+// Weighted Voronoi Foam — web port of the TouchDesigner patch 20260926_Foam.toe (/project1/S2_FOAM)
+// Sim: per-frame cell-id map on the GPU (curved power metric, read back), statistics + von
+// Neumann-Mullins coarsening + bubble mechanics on the CPU. Look: walls drawn at screen resolution
+// from the cell map's candidates (exact distance to the wall). Sound: Web Audio, same mapping as foam_audio.
+
+// ---------------- parameters (values saved in the .toe; others = TD defaults) ----------------
+const P = {
+  count: 800, coarsen: 5, popsize: 2000, relax: 0, bulge: 0.63,
+  spawnrate: 30, spread: 0.9, inflate: 1.5, pressure: 0.6, cohesion: 1, damping: 5,
+  contrast: 0.6, clusters: 8, clustersize: 0.4, clusterdrift: 0.03,
+  simheight: 280,     // TD default 400; lowered for phones (the sim pace is normalized to 720 px)
+  linewidth: 3.57, junction: 0, shade: 0.163, shadewidth: 1,
+  sound: true, volume: 0.5, voices: 8, voicegain: 0.03, pitchlow: 45, pitchhigh: 84, scale: true,
+  popgain: 0.7, popdecay: 0.08, poppitch: 12, width: 0.8,
+};
+const LOOKS = {
+  night: { line: [1, 1, 1], top: [0, 0, 0], bot: [0, 0, 0], shade: 0.163, shadewidth: 1, junction: 0, linewidth: 3.57 },
+  day: { line: [0.16, 0.22, 0.31], top: [0.94, 0.96, 0.99], bot: [0.72, 0.79, 0.89], shade: 0.35, shadewidth: 30, junction: 5, linewidth: 1.6 },
+};
+let look = 'night';
+const REF_ASPECT = 1200 / 1920;     // the TD output was 1200 x 1920 with 800 bubbles
+const MAXN = 1024;
+const COARSEN_K = 1400.0, CURVE_K = 0.3, FRONT_AGE = 4.0, INIT_FILL = 0.35;
+
+// ---------------- WebGL ----------------
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
+function fail(msg) { const e = document.getElementById('err'); e.textContent = msg; e.style.display = 'flex'; throw new Error(msg); }
+if (!gl) fail('This page needs WebGL2.');
+
+const VS = `#version 300 es
+in vec2 aP; void main(){ gl_Position = vec4(aP, 0.0, 1.0); }`;
+const LABEL_FS = `#version 300 es
+precision highp float; precision highp int;
+uniform highp sampler2D uSeeds; uniform int uN; uniform float uK;
+out vec4 o;
+void main(){
+  vec2 x = gl_FragCoord.xy;
+  float best = 1e30; int id = 0;
+  for (int i = 0; i < ${MAXN}; i++) {
+    if (i >= uN) break;
+    vec4 sd = texelFetch(uSeeds, ivec2(i, 0), 0);
+    vec2 d = x - sd.xy; float dl = length(d);
+    float f = dl * dl - sd.z - 2.0 * uK * sd.w * (dl - sd.w);
+    if (f < best) { best = f; id = i; }
+  }
+  o = vec4(float(id & 255) / 255.0, float(id >> 8) / 255.0, 0.0, 1.0);
+}`;
+const LOOK_FS = `#version 300 es
+precision highp float; precision highp int;
+uniform highp sampler2D uSeeds; uniform highp sampler2D uLabel;
+uniform vec2 uSim; uniform vec2 uOut; uniform float uK;
+uniform vec4 uA;            // x line width, y junction, z shade, w shade width (output px)
+uniform vec3 uLine, uTop, uBot;
+out vec4 o;
+#define MAXC 18
+int lab(ivec2 q){ vec4 t = texelFetch(uLabel, q, 0); return int(t.r * 255.0 + 0.5) + 256 * int(t.g * 255.0 + 0.5); }
+void main(){
+  vec2 uv = gl_FragCoord.xy / uOut;
+  vec2 x = uv * uSim;
+  float toOut = uOut.y / uSim.y;
+  ivec2 lr = ivec2(uSim); ivec2 c = ivec2(floor(x));
+  int ids[MAXC]; int n = 0;
+  for (int ring = 0; ring < 2; ring++) {
+    int stp = ring == 0 ? 1 : 4;
+    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
+      int id = lab(clamp(c + ivec2(dx, dy) * stp, ivec2(0), lr - 1));
+      bool seen = false;
+      for (int k = 0; k < MAXC; k++) { if (k >= n) break; if (ids[k] == id) seen = true; }
+      if (!seen && n < MAXC) { ids[n] = id; n++; }
+    }
+  }
+  float f1 = 1e30, f2 = 1e30, f3 = 1e30; vec2 g1 = vec2(0), g2 = vec2(0), g3 = vec2(0);
+  for (int k = 0; k < MAXC; k++) {
+    if (k >= n) break;
+    vec4 sd = texelFetch(uSeeds, ivec2(ids[k], 0), 0);
+    vec2 d = x - sd.xy; float dl = max(length(d), 1e-4);
+    float f = dl * dl - sd.z - 2.0 * uK * sd.w * (dl - sd.w);
+    vec2 g = d * (2.0 - 2.0 * uK * sd.w / dl);
+    if (f < f1) { f3 = f2; g3 = g2; f2 = f1; g2 = g1; f1 = f; g1 = g; }
+    else if (f < f2) { f3 = f2; g3 = g2; f2 = f; g2 = g; }
+    else if (f < f3) { f3 = f; g3 = g; }
+  }
+  float d2 = n < 2 ? 1e4 : (f2 - f1) / max(length(g2 - g1), 1e-4) * toOut;
+  float d3 = n < 3 ? 1e4 : (f3 - f1) / max(length(g3 - g1), 1e-4) * toOut;
+  float hw = 0.5 * uA.x;
+  float line = 1.0 - smoothstep(hw - 0.7, hw + 0.7, d2);
+  float J = uA.y;
+  float pl = J > 0.0 ? 1.0 - smoothstep(J - 0.8, J + 0.8, d2 + d3) : 0.0;
+  float wall = max(line, pl);
+  // stands in for the blurred walls of the TD patch: a line of width w blurred over S px has a
+  // peak of ~w/S and a soft falloff
+  float S = max(uA.w, 1.0);
+  float film = min(uA.x / S, 1.0) * exp(-(d2 * d2) / (0.25 * S * S));
+  vec3 bg = mix(uBot, uTop, smoothstep(0.0, 1.0, uv.y));
+  vec2 v = uv - 0.5; bg *= 1.0 - 0.18 * dot(v, v) * 2.0;
+  vec3 col = mix(bg, uLine, clamp(film * 2.5, 0.0, 1.0) * uA.z);
+  col = mix(col, uLine, wall);
+  o = vec4(col, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fail('Shader error: ' + gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'aP'); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fail('Link error: ' + gl.getProgramInfoLog(p));
+  const u = {}; const nu = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < nu; i++) { const a = gl.getActiveUniform(p, i); u[a.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, a.name); }
+  return { p, u };
+}
+const progLabel = program(LABEL_FS), progLook = program(LOOK_FS);
+const quad = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quad);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+const seedTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, seedTex);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAXN, 1, 0, gl.RGBA, gl.FLOAT, null);
+for (const k of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, k, gl.NEAREST);
+const seedBuf = new Float32Array(MAXN * 4);
+
+let labelTex = null, labelFbo = null, labelPix = null, ids = null;
+function makeLabelTarget(Ws, Hs) {
+  if (labelTex) { gl.deleteTexture(labelTex); gl.deleteFramebuffer(labelFbo); }
+  labelTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, labelTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, Ws, Hs, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  for (const k of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, k, gl.NEAREST);
+  for (const k of [gl.TEXTURE_WRAP_S, gl.TEXTURE_WRAP_T]) gl.texParameteri(gl.TEXTURE_2D, k, gl.CLAMP_TO_EDGE);
+  labelFbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, labelFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, labelTex, 0);
+  labelPix = new Uint8Array(Ws * Hs * 4); ids = new Uint16Array(Ws * Hs);
+}
+
+// ---------------- sizing ----------------
+let Ws = 0, Hs = 0, outW = 0, outH = 0;
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  let w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  if (!(w > 0 && h > 0)) { w = 1200; h = 1920; }      // laid out hidden: keep a valid size until the next resize
+  const cap = 3.0e6; if (w * h > cap) { const s = Math.sqrt(cap / (w * h)); w = Math.round(w * s); h = Math.round(h * s); }
+  canvas.width = outW = w; canvas.height = outH = h;
+  const hs = P.simheight, ws = Math.max(16, Math.round(hs * w / h));
+  if (ws !== Ws || hs !== Hs) { Ws = ws; Hs = hs; makeLabelTarget(Ws, Hs); }
+}
+function defaultCount() {
+  const a = innerWidth / innerHeight;            // 0/0 while the page is laid out hidden
+  return Number.isFinite(a) && a > 0 ? Math.min(1000, Math.max(50, Math.round(800 * a / REF_ASPECT / 10) * 10)) : 800;
+}
+
+// ---------------- simulation state ----------------
+let S = null;
+function rnd(a, b) { return a + Math.random() * (b - a); }
+function gauss() { let u = 0, v = 0; while (u === 0) u = Math.random(); v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+function initSim() {
+  pins.clear();
+  const n = Math.max(Math.floor(P.count * INIT_FILL), 4);
+  const s0 = Math.sqrt(Ws * Hs / n / Math.PI);
+  S = { x: [], y: [], w: [], s: [], birth: [], D: [], vx: [], vy: [], uid: [], weff: [],
+        clock: 0, acc: 0, dims: [Ws, Hs], pops: 0, born: 0, nextUid: n,
+        cent: null, cvel: null, peak: new Map(), areaPrev: new Map(), popEvents: [], snd: null };
+  for (let i = 0; i < n; i++) {
+    S.x.push(rnd(0, Ws)); S.y.push(rnd(0, Hs)); S.w.push(0); S.s.push(s0); S.birth.push(-1e9); S.D.push(0);
+    S.vx.push(0); S.vy.push(0); S.uid.push(i); S.weff.push(0);
+  }
+}
+
+function clusters(dt) {
+  const k = P.clusters | 0;
+  if (!S.cent || S.cent.length !== k) {
+    S.cent = []; S.cvel = [];
+    for (let i = 0; i < k; i++) { S.cent.push([rnd(0.15, 0.85) * Ws, rnd(0.15, 0.85) * Hs]); S.cvel.push([gauss(), gauss()]); }
+  }
+  for (let i = 0; i < k; i++) {
+    const c = S.cent[i], v = S.cvel[i];
+    v[0] += gauss() * dt * 2; v[1] += gauss() * dt * 2;
+    const m = Math.max(Math.hypot(v[0], v[1]), 1e-6); v[0] /= m; v[1] /= m;
+    c[0] += v[0] * P.clusterdrift * Hs * dt; c[1] += v[1] * P.clusterdrift * Hs * dt;
+    if (c[0] < 0 || c[0] > Ws) { v[0] *= -1; c[0] = Math.min(Math.max(c[0], 0), Ws); }
+    if (c[1] < 0 || c[1] > Hs) { v[1] *= -1; c[1] = Math.min(Math.max(c[1], 0), Hs); }
+  }
+}
+function field(x, y, sigma) {
+  let m = Infinity;
+  for (const c of S.cent) { const d = (x - c[0]) ** 2 + (y - c[1]) ** 2; if (d < m) m = d; }
+  return Math.exp(-m / (2 * sigma * sigma));
+}
+
+// ---------------- interaction ----------------
+const pointers = new Map();      // pointerId -> state
+const forcePop = new Set();      // uids popped by a tap
+const pins = new Map();          // uid -> pointer state (held bubble follows the finger)
+const HOLD_MS = 220, MOVE_TOL = 10;
+let pendingBlow = [];            // pointer states waiting for a bubble to be born
+
+function toSim(e) { return [e.clientX / innerWidth * Ws, (1 - e.clientY / innerHeight) * Hs]; }
+function uidAt(x, y) {
+  // ids index the seed order the map was built from (before this frame's pops / births)
+  if (!ids || !S || !S.mapUid) return -1;
+  const i = ids[Math.min(Hs - 1, Math.max(0, y | 0)) * Ws + Math.min(Ws - 1, Math.max(0, x | 0))];
+  return i < S.mapUid.length ? S.mapUid[i] : -1;
+}
+canvas.addEventListener('pointerdown', e => {
+  try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+  startAudio(); hideHint();
+  const [x, y] = toSim(e);
+  const st = { id: e.pointerId, x, y, x0: e.clientX, y0: e.clientY, t0: performance.now(), mode: 'press',
+               vx: 0, vy: 0, lt: performance.now(), uid: -1 };
+  st.timer = setTimeout(() => { if (st.mode === 'press') { st.mode = 'blow'; pendingBlow.push(st); } }, HOLD_MS);
+  pointers.set(e.pointerId, st);
+});
+canvas.addEventListener('pointermove', e => {
+  const st = pointers.get(e.pointerId); if (!st) return;
+  const [x, y] = toSim(e); const t = performance.now(); const dt = Math.max((t - st.lt) / 1000, 1e-3);
+  const a = Math.min(1, dt / 0.05);
+  st.vx += ((x - st.x) / dt - st.vx) * a; st.vy += ((y - st.y) / dt - st.vy) * a;
+  st.x = x; st.y = y; st.lt = t;
+  if (st.mode === 'press' && Math.hypot(e.clientX - st.x0, e.clientY - st.y0) > MOVE_TOL) { st.mode = 'stir'; clearTimeout(st.timer); }
+});
+function endPointer(e) {
+  const st = pointers.get(e.pointerId); if (!st) return;
+  clearTimeout(st.timer);
+  if (st.mode === 'press') { const u = uidAt(st.x, st.y); if (u >= 0) forcePop.add(u); }
+  if (st.uid >= 0) pins.delete(st.uid);
+  st.mode = 'done'; pointers.delete(e.pointerId);
+}
+canvas.addEventListener('pointerup', endPointer);
+canvas.addEventListener('pointercancel', endPointer);
+canvas.addEventListener('lostpointercapture', endPointer);
+canvas.addEventListener('contextmenu', e => e.preventDefault());    // long press would open a menu
+let hintTimer = setTimeout(hideHint, 9000);
+function hideHint() { document.getElementById('hint').classList.add('gone'); clearTimeout(hintTimer); }
+
+// ---------------- one simulation step (port of foam_sim.step) ----------------
+function step(dtIn) {
+  if (!S || S.dims[0] !== Ws || S.dims[1] !== Hs) { initSim(); return; }
+  const dt = Math.min(Math.max(dtIn, 0), 2 / 60);
+  S.clock += dt; const clock = S.clock;
+  const n = S.x.length; if (n === 0) { initSim(); return; }
+  const { x, y, w, s, birth, D, vx, vy, uid } = S;
+  S.mapUid = uid.slice();
+
+  const area = new Float64Array(n), sx = new Float64Array(n), sy = new Float64Array(n);
+  for (let r = 0, p = 0; r < Hs; r++) {
+    const Y = r + 0.5;
+    for (let c = 0; c < Ws; c++, p++) { let id = ids[p]; if (id >= n) id = n - 1; ids[p] = id; area[id]++; sx[id] += c + 0.5; sy[id] += Y; }
+  }
+  const safe = new Float64Array(n), cx = new Float64Array(n), cy = new Float64Array(n);
+  for (let i = 0; i < n; i++) { safe[i] = Math.max(area[i], 1); cx[i] = sx[i] / safe[i]; cy[i] = sy[i] / safe[i]; }
+
+  // neighbours from pixel boundaries
+  const pairs = new Map();
+  for (let r = 0; r < Hs; r++) {
+    const o = r * Ws;
+    for (let c = 0; c < Ws; c++) {
+      const a = ids[o + c];
+      if (c + 1 < Ws) { const b = ids[o + c + 1]; if (a !== b) { const k = a < b ? a * MAXN + b : b * MAXN + a; pairs.set(k, (pairs.get(k) || 0) + 1); } }
+      if (r + 1 < Hs) { const b = ids[o + Ws + c]; if (a !== b) { const k = a < b ? a * MAXN + b : b * MAXN + a; pairs.set(k, (pairs.get(k) || 0) + 1); } }
+    }
+  }
+  const li = [], hj = [], ln = [];
+  const sides = new Float64Array(n), gain = new Float64Array(n);
+  for (const [k, cnt] of pairs) {
+    if (cnt < 2) continue;
+    const a = (k / MAXN) | 0, b = k % MAXN;
+    li.push(a); hj.push(b); ln.push(cnt);
+    const d = Math.hypot(x[a] - x[b], y[a] - y[b]) + 1e-3, g = cnt / (2 * d);
+    sides[a]++; sides[b]++; gain[a] += g; gain[b] += g;
+  }
+  const onwall = new Uint8Array(n);
+  for (let c = 0; c < Ws; c++) { onwall[ids[c]] = 1; onwall[ids[(Hs - 1) * Ws + c]] = 1; }
+  for (let r = 0; r < Hs; r++) { onwall[ids[r * Ws]] = 1; onwall[ids[r * Ws + Ws - 1]] = 1; }
+
+  let meanA = 0, nl = 0; for (let i = 0; i < n; i++) if (area[i] > 0) { meanA += area[i]; nl++; }
+  meanA = nl ? meanA / nl : 1;
+  const u2 = (Hs / 720) ** 2, refA = Ws * Hs / Math.max(P.count, 1), inflate = Math.max(P.inflate, 1e-3);
+  const age = new Float64Array(n), growing = new Uint8Array(n);
+  for (let i = 0; i < n; i++) { age[i] = clock - birth[i]; growing[i] = age[i] < inflate ? 1 : 0; }
+
+  // von Neumann-Mullins coarsening through the weights (area conserving)
+  const K = COARSEN_K * u2 * P.coarsen * (refA / (Ws * Hs / 40));
+  clusters(dt);
+  const sigma = P.clustersize * Hs, contrast = P.contrast;
+  const dw = new Float64Array(n), active = new Uint8Array(n);
+  let na = 0, sumA = 0; const dA = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    active[i] = (!onwall[i] && sides[i] > 0 && area[i] > 0 && !growing[i]) ? 1 : 0;
+    if (!active[i]) continue;
+    const crate = (1 - contrast) + contrast * (0.25 + 1.75 * (1 - field(x[i], y[i], sigma)));
+    dA[i] = K * (sides[i] - 6) * dt * Math.min(Math.max(area[i] / refA, 0.05), 3) * crate;
+    sumA += dA[i]; na++;
+  }
+  if (na && K > 0) { const m = sumA / na; for (let i = 0; i < n; i++) if (active[i]) dw[i] = (dA[i] - m) / Math.max(gain[i], 1e-3); }
+  // held bubbles keep inflating (interaction): area grows by ~0.8 mean bubbles per second.
+  // gain is ~pi/2 for a settled cell but ~0 for a newborn, so it is floored at 1
+  for (const [u, st] of pins) {
+    const i = uid.indexOf(u); if (i < 0) continue;
+    if (area[i] < 0.15 * Ws * Hs) dw[i] += 0.8 * Math.max(meanA, refA) * dt / Math.max(gain[i], 1);
+  }
+  let wm = 0;
+  for (let i = 0; i < n; i++) {
+    const st = area[i] > 0 ? Math.sqrt(safe[i] / Math.PI) : s[i];
+    s[i] += (st - s[i]) * Math.min(1, 3 * dt);
+    w[i] += dw[i]; wm += w[i];
+  }
+  wm /= n; for (let i = 0; i < n; i++) w[i] -= wm;
+
+  const f = Math.min(P.relax * dt * 60, 0.4);
+  const ox0 = x.slice(), oy0 = y.slice();
+  for (let i = 0; i < n; i++) if (area[i] > 0) { x[i] += (cx[i] - x[i]) * f; y[i] += (cy[i] - y[i]) * f; }
+
+  // neighbour mechanics: pressure + cohesion, seeds have inertia
+  const ax = new Float64Array(n), ay = new Float64Array(n);
+  const L = Math.sqrt(refA);
+  for (let e = 0; e < li.length; e++) {
+    const a = li[e], b = hj[e];
+    let ux = x[b] - x[a], uy = y[b] - y[a]; const dd = Math.hypot(ux, uy) + 1e-3; ux /= dd; uy /= dd;
+    const Pa = Math.min(refA / safe[a], 4), Pb = Math.min(refA / safe[b], 4);
+    const fp = P.pressure * 3 * (Pa - Pb) * ln[e];
+    const rr = Math.sqrt(safe[a] / Math.PI) + Math.sqrt(safe[b] / Math.PI);
+    const fs = P.cohesion * 4 * Math.min(Math.max(dd - rr, -L), L);
+    const fx = (fp - fs) * ux, fy = (fp - fs) * uy;
+    ax[b] += fx; ay[b] += fy; ax[a] -= fx; ay[a] -= fy;
+  }
+  const amax = 60 * L, damp = Math.exp(-P.damping * dt);
+  for (let i = 0; i < n; i++) {
+    if (growing[i]) { ax[i] = 0; ay[i] = 0; }
+    const m = Math.hypot(ax[i], ay[i]), sc = Math.min(1, amax / Math.max(m, 1e-6));
+    vx[i] = (vx[i] + ax[i] * sc * dt) * damp; vy[i] = (vy[i] + ay[i] * sc * dt) * damp;
+  }
+  // stirring (interaction): seeds near a dragging finger take on its velocity
+  const R = 0.12 * Hs;
+  for (const st of pointers.values()) {
+    if (st.mode !== 'stir') continue;
+    const k = Math.min(1, 10 * dt);
+    for (let i = 0; i < n; i++) {
+      const d2 = (x[i] - st.x) ** 2 + (y[i] - st.y) ** 2; if (d2 > 4 * R * R) continue;
+      const fo = Math.exp(-d2 / (R * R)) * k;
+      vx[i] += (st.vx - vx[i]) * fo; vy[i] += (st.vy - vy[i]) * fo;
+    }
+  }
+  for (let i = 0; i < n; i++) {
+    x[i] += vx[i] * dt; y[i] += vy[i] * dt;
+    // keep each seed within half a radius of its centroid (else the cell vanishes = false pop)
+    const ox = x[i] - cx[i], oy = y[i] - cy[i], om = Math.hypot(ox, oy), lim = 0.5 * Math.sqrt(safe[i] / Math.PI);
+    const sc = (area[i] > 0 && om > lim) ? lim / Math.max(om, 1e-6) : 1;
+    x[i] += (cx[i] + ox * sc - x[i]) * 0.35; y[i] += (cy[i] + oy * sc - y[i]) * 0.35;
+    if (!(area[i] > 0)) { x[i] = ox0[i]; y[i] = oy0[i]; }
+    x[i] = Math.min(Math.max(x[i], 0.5), Ws - 0.5); y[i] = Math.min(Math.max(y[i], 0.5), Hs - 0.5);
+  }
+  // held bubbles follow the finger
+  for (const [u, st] of pins) {
+    const i = uid.indexOf(u); if (i < 0) continue;
+    x[i] = Math.min(Math.max(st.x, 0.5), Ws - 0.5); y[i] = Math.min(Math.max(st.y, 0.5), Hs - 0.5);
+    vx[i] = st.vx * 0.5; vy[i] = st.vy * 0.5;
+  }
+
+  // pops: settled cells that became too small, plus tapped ones
+  const dead = new Uint8Array(n); let ndead = 0;
+  for (let i = 0; i < n; i++) {
+    let d = area[i] < P.popsize * u2 && !growing[i];
+    if (pins.has(uid[i])) d = false;
+    if (forcePop.has(uid[i])) d = true;
+    if (d) { dead[i] = 1; ndead++; }
+  }
+  forcePop.clear();
+  S.pops += ndead;
+
+  // sound data
+  const dadt = new Float64Array(n), peakNow = new Float64Array(n);
+  const newPrev = new Map();
+  for (let i = 0; i < n; i++) {
+    const pv = S.areaPrev.get(uid[i]);
+    let pk = area[i];
+    if (pv) { if (dt > 0) dadt[i] = (area[i] - pv[0]) / dt; pk = Math.max(pk, pv[1]); }
+    peakNow[i] = pk; newPrev.set(uid[i], [area[i], pk]);
+  }
+  S.areaPrev = newPrev;
+  S.snd = { uid: uid.slice(), area, dadt, x: x.map(v => v / Ws), active: Array.from(area, (a, i) => !onwall[i] && a > 0 && !growing[i]), meanA };
+  for (let i = 0; i < n; i++) if (dead[i]) S.popEvents.push([peakNow[i], x[i] / Ws, meanA]);
+  if (S.popEvents.length > 256) S.popEvents.splice(0, S.popEvents.length - 256);
+
+  // growth: one bubble at a time next to a recently born one (spreading front)
+  const born = [];
+  function birthAt(qx, qy) {
+    qx = Math.min(Math.max(qx, 0.5), Ws - 0.5); qy = Math.min(Math.max(qy, 0.5), Hs - 0.5);
+    const h = ids[(qy | 0) * Ws + (qx | 0)];
+    if (dead[h]) return -1;
+    const u = S.nextUid++;
+    born.push([qx, qy, w[h], 0.5, area[h] / Math.PI * 1.2, u]); S.born++;
+    return u;
+  }
+  for (const st of pendingBlow) { if (st.mode === 'blow') { const u = birthAt(st.x, st.y); if (u >= 0) { st.uid = u; pins.set(u, st); } } }
+  pendingBlow = [];
+  S.acc += P.spawnrate * dt;
+  let nfree = P.count - (n - ndead) - born.length;
+  const front = []; for (let i = 0; i < n; i++) if (age[i] < FRONT_AGE && area[i] > 0 && !dead[i]) front.push(i);
+  while (S.acc >= 1) {
+    S.acc -= 1;
+    if (nfree <= 0) continue;
+    let q = null;
+    if (front.length && Math.random() < P.spread) {
+      for (let t = 0; t < 4; t++) {
+        const p = front[(Math.random() * front.length) | 0];
+        const r = Math.sqrt(area[p] / Math.PI) * rnd(1, 1.6), a = rnd(0, 2 * Math.PI);
+        const cand = [x[p] + Math.cos(a) * r, y[p] + Math.sin(a) * r];
+        if (Math.random() <= (1 - contrast) + contrast * field(cand[0], cand[1], sigma)) { q = cand; break; }
+      }
+    }
+    if (!q) {
+      if (Math.random() < contrast) { const c0 = S.cent[(Math.random() * S.cent.length) | 0]; q = [c0[0] + gauss() * sigma * 0.5, c0[1] + gauss() * sigma * 0.5]; }
+      else q = [rnd(0, Ws), rnd(0, Hs)];
+    }
+    if (birthAt(q[0], q[1]) >= 0) nfree--;
+  }
+
+  // remove dead, append newborns
+  const keys = ['x', 'y', 'w', 's', 'birth', 'D', 'vx', 'vy', 'uid'];
+  if (ndead) for (const k of keys) S[k] = S[k].filter((_, i) => !dead[i]);
+  for (const b of born) {
+    S.x.push(b[0]); S.y.push(b[1]); S.w.push(b[2]); S.s.push(b[3]); S.birth.push(clock); S.D.push(b[4]);
+    S.vx.push(0); S.vy.push(0); S.uid.push(b[5]);
+  }
+  if (S.x.length > MAXN) for (const k of keys) S[k].length = MAXN;
+  if (S.x.length === 0) { initSim(); return; }
+  S.weff = S.w.map((wi, i) => { let t = Math.min(Math.max((clock - S.birth[i]) / inflate, 0), 1); t = t * t * (3 - 2 * t); return wi - S.D[i] * (1 - t); });
+}
+
+// ---------------- sound (port of foam_audio) ----------------
+let actx = null, bus = null, voices = [], grains = 0;
+const PENTA = [0, 2, 4, 7, 9];
+const A = { rlo: null, rhi: null, amp: new Map(), freq: new Map(), slot: new Map() };
+function startAudio() {
+  if (!P.sound) return;
+  if (!actx) {
+    const AC = window.AudioContext || window.webkitAudioContext; if (!AC) return;
+    actx = new AC();
+    bus = actx.createGain();
+    const shaper = actx.createWaveShaper(); const curve = new Float32Array(2048);
+    for (let i = 0; i < curve.length; i++) { const v = (i / (curve.length - 1)) * 2 - 1; curve[i] = Math.tanh(v * 4) * 0.7; }
+    shaper.curve = curve;                 // input is pre-scaled by 1/4 -> tanh(L*vol*1.5)*0.7 over |L*vol*1.5| < 4
+    bus.connect(shaper).connect(actx.destination);
+  }
+  if (actx.state !== 'running') actx.resume();
+  setBus();
+}
+function setBus() { if (bus) bus.gain.setTargetAtTime(P.sound ? P.volume * 1.5 / 4 : 0, actx.currentTime, 0.05); }
+function voice(i) {
+  while (voices.length <= i) {
+    const o = actx.createOscillator(), g = actx.createGain(), p = actx.createStereoPanner();
+    o.type = 'sine'; g.gain.value = 0; o.connect(g).connect(p).connect(bus); o.start();
+    voices.push({ o, g, p, uid: -1, amp: 0, f: 220 });
+  }
+  return voices[i];
+}
+function pitch(r) {
+  const lo = P.pitchlow, hi = P.pitchhigh;
+  const sN = Math.min(Math.max((Math.log(r) - Math.log(A.rlo)) / Math.max(Math.log(A.rhi / A.rlo), 1e-6), 0), 1);
+  let midi = hi - sN * (hi - lo);
+  if (P.scale) {
+    const oc = Math.floor(midi / 12), deg = midi - oc * 12;
+    let best = PENTA[0]; for (const p of PENTA) if (Math.abs(deg - p) < Math.abs(deg - best)) best = p;
+    midi = oc * 12 + best;
+  }
+  return midi;
+}
+const hz = m => 440 * 2 ** ((m - 69) / 12);
+function sound(dtF) {
+  if (!actx || actx.state !== 'running' || !S || !S.snd) return;
+  const snd = S.snd, n = snd.area.length, now = actx.currentTime;
+  const r = Array.from(snd.area, a => Math.sqrt(Math.max(a, 1) / Math.PI));
+  const live = r.filter((_, i) => snd.area[i] > 0).sort((a, b) => a - b);
+  const pct = q => live.length ? live[Math.min(live.length - 1, Math.floor(q * (live.length - 1)))] : 1;
+  const loN = pct(0.03), hiN = Math.max(pct(0.97), (A.rlo ?? loN) * 1.5);
+  A.rlo = A.rlo == null ? loN : A.rlo + (loN - A.rlo) * 0.02;
+  A.rhi = A.rhi == null ? Math.max(hiN, A.rlo * 1.5) : A.rhi + (Math.max(hiN, A.rlo * 1.5) - A.rhi) * 0.02;
+  const width = P.width;
+
+  // voices: the most active bubbles (largest |dA/dt| / A)
+  const act = Array.from(snd.area, (a, i) => snd.active[i] ? Math.abs(snd.dadt[i]) / Math.max(a, 1) : 0);
+  const nv = P.voices | 0;
+  const sel = act.map((v, i) => i).sort((a, b) => act[b] - act[a]).slice(0, nv).filter(i => act[i] > 0);
+  const target = new Map();
+  if (sel.length) {
+    const sorted = sel.map(i => act[i]).sort((a, b) => a - b), ref = Math.max(sorted[sorted.length >> 1], 1e-6);
+    for (const i of sel) target.set(snd.uid[i], [Math.min(Math.max(act[i] / (2 * ref), 0), 1) ** 0.5, hz(pitch(r[i])), snd.x[i]]);
+  }
+  const g = P.voicegain / Math.sqrt(Math.max(nv, 1)), lag = 1 - Math.exp(-dtF / 0.12);
+  for (let i = 0; i < Math.max(nv, voices.length); i++) voice(i);
+  const used = new Set();
+  for (const v of voices) if (v.uid >= 0) used.add(v.uid);
+  for (const u of target.keys()) if (!used.has(u)) {          // free slot for a new singer
+    const v = voices.find((v, i) => i < nv && v.uid < 0) || voices.filter((v, i) => i < nv && !target.has(v.uid)).sort((a, b) => a.amp - b.amp)[0];
+    if (v) { v.uid = u; v.amp = 0; v.f = target.get(u)[1]; v.o.frequency.setValueAtTime(v.f, now); }
+  }
+  for (let i = 0; i < voices.length; i++) {
+    const v = voices[i];
+    const t = i < nv ? target.get(v.uid) : null;
+    const lv = t ? t[0] : 0;
+    v.amp += (lv - v.amp) * lag;
+    if (t) { v.f += (t[1] - v.f) * lag; v.o.frequency.setTargetAtTime(v.f, now, 0.02); v.p.pan.setTargetAtTime((t[2] - 0.5) * width * 2, now, 0.05); }
+    if (!t && v.amp < 1e-4) { v.uid = -1; v.amp = 0; }
+    v.g.gain.setTargetAtTime(v.amp * g, now, 0.02);
+  }
+
+  // pops: a short decaying sine grain per popped bubble
+  const ev = S.popEvents;
+  for (const [peak, px, mA] of ev) {
+    if (grains >= 64) break;
+    const rr = Math.sqrt(Math.max(peak, 1) / Math.PI);
+    const f0 = hz(pitch(rr) + P.poppitch);
+    const amp = P.popgain * Math.min(Math.sqrt(Math.max(peak, 1) / Math.max(mA, 1)), 2) * 0.35;
+    const o = actx.createOscillator(), gg = actx.createGain(), pn = actx.createStereoPanner();
+    o.frequency.value = f0; pn.pan.value = (px - 0.5) * width * 2;
+    gg.gain.setValueAtTime(0, now); gg.gain.linearRampToValueAtTime(amp, now + 0.002);
+    gg.gain.setTargetAtTime(0, now + 0.002, P.popdecay);
+    o.connect(gg).connect(pn).connect(bus); o.start(now); o.stop(now + 0.002 + P.popdecay * 6);
+    grains++; o.onended = () => { grains--; o.disconnect(); gg.disconnect(); pn.disconnect(); };
+  }
+  ev.length = 0;
+}
+
+// ---------------- frame ----------------
+function uploadSeeds() {
+  const n = Math.min(S.x.length, MAXN);
+  for (let i = 0; i < n; i++) {
+    seedBuf[i * 4] = S.x[i]; seedBuf[i * 4 + 1] = S.y[i]; seedBuf[i * 4 + 2] = S.weff[i]; seedBuf[i * 4 + 3] = Math.max(S.s[i], 1e-3);
+  }
+  gl.bindTexture(gl.TEXTURE_2D, seedTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, MAXN, 1, gl.RGBA, gl.FLOAT, seedBuf);
+  return n;
+}
+let lastT = performance.now() / 1000, fps = 60;
+function frame() {
+  requestAnimationFrame(frame);
+  const now = performance.now() / 1000, dtF = Math.min(now - lastT, 0.1); lastT = now;
+  fps += (1 / Math.max(dtF, 1e-3) - fps) * 0.05;
+  tick(dtF);
+}
+function tick(dtF) {
+  if (!S || S.dims[0] !== Ws || S.dims[1] !== Hs) initSim();
+  const n = uploadSeeds(), k = P.bulge * CURVE_K;
+
+  // 1. cell-id map at sim resolution, read back for the statistics
+  gl.bindFramebuffer(gl.FRAMEBUFFER, labelFbo); gl.viewport(0, 0, Ws, Hs);
+  gl.useProgram(progLabel.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, seedTex); gl.uniform1i(progLabel.u.uSeeds, 0);
+  gl.uniform1i(progLabel.u.uN, n); gl.uniform1f(progLabel.u.uK, 0);   // TD: label uses k = 0, only the walls bend
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  gl.readPixels(0, 0, Ws, Hs, gl.RGBA, gl.UNSIGNED_BYTE, labelPix);
+  for (let i = 0, j = 0; i < ids.length; i++, j += 4) ids[i] = labelPix[j] + (labelPix[j + 1] << 8);
+
+  // 2. walls at screen resolution
+  const Lk = LOOKS[look], sc = outH / 1920;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, outW, outH);
+  gl.useProgram(progLook.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, seedTex); gl.uniform1i(progLook.u.uSeeds, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, labelTex); gl.uniform1i(progLook.u.uLabel, 1);
+  gl.uniform2f(progLook.u.uSim, Ws, Hs); gl.uniform2f(progLook.u.uOut, outW, outH); gl.uniform1f(progLook.u.uK, k);
+  gl.uniform4f(progLook.u.uA, Math.max(P.linewidth * sc, 1), Lk.junction * sc, Lk.shade, Lk.shadewidth * sc);
+  gl.uniform3fv(progLook.u.uLine, Lk.line); gl.uniform3fv(progLook.u.uTop, Lk.top); gl.uniform3fv(progLook.u.uBot, Lk.bot);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  // 3. advance the sim with this frame's map, then the sound
+  step(dtF);
+  sound(dtF);
+}
+
+// ---------------- UI ----------------
+const sliders = [['Count', 'count', v => v | 0], ['Coarsen', 'coarsen', v => v.toFixed(1)], ['Bulge', 'bulge', v => v.toFixed(2)],
+                 ['Line', 'linewidth', v => v.toFixed(1)], ['Volume', 'volume', v => v.toFixed(2)]];
+function syncUI() {
+  for (const [id, key, fmt] of sliders) {
+    document.getElementById('s' + id).value = P[key]; document.getElementById('v' + id).textContent = fmt(P[key]);
+  }
+  document.getElementById('bSound').classList.toggle('on', P.sound);
+  document.getElementById('bLook').textContent = look === 'night' ? 'Day' : 'Night';
+  document.body.classList.toggle('day', look === 'day');
+}
+for (const [id, key, fmt] of sliders) {
+  document.getElementById('s' + id).addEventListener('input', e => {
+    P[key] = parseFloat(e.target.value); document.getElementById('v' + id).textContent = fmt(P[key]);
+    if (key === 'volume') setBus();
+  });
+}
+document.getElementById('bSound').onclick = () => { P.sound = !P.sound; if (P.sound) startAudio(); else setBus(); syncUI(); };
+document.getElementById('bLook').onclick = () => { look = look === 'night' ? 'day' : 'night'; P.linewidth = LOOKS[look].linewidth; syncUI(); };
+document.getElementById('bReset').onclick = () => { S = null; pins.clear(); };
+document.getElementById('bPanel').onclick = e => { const p = document.getElementById('panel'); p.hidden = !p.hidden; e.target.classList.toggle('on', !p.hidden); };
+
+P.count = defaultCount();
+resize(); syncUI();
+addEventListener('resize', () => { resize(); });
+window.__foam = { tick, pins, P, get S() { return S; }, get fps() { return fps; }, get dims() { return [Ws, Hs, outW, outH]; } };
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
