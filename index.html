@@ -72,7 +72,8 @@ const P = {
   contrast: 0.6, clusters: 8, clustersize: 0.4, clusterdrift: 0.03,
   simheight: 280,     // TD default 400; lowered for phones (the sim pace is normalized to 720 px)
   linewidth: 3.57, shortwall: 0.5, smooth: 0.25,
-  sound: true, volume: 0.5, voices: 8, voicegain: 0.03, pitchlow: 45, pitchhigh: 84, scale: true,
+  // TD Voicegain 0.03; raised x4 so the growing bubbles alone carry the piece. shrinkgain: level of shrinking ones
+  sound: true, volume: 0.5, voices: 8, voicegain: 0.12, shrinkgain: 0.35, pitchlow: 45, pitchhigh: 84, scale: true,
   popgain: 0.7, popdecay: 0.08, poppitch: 12, width: 0.8,
 };
 const LOOKS = {
@@ -446,7 +447,7 @@ function step(dtIn) {
     peakNow[i] = pk; newPrev.set(uid[i], [area[i], pk]);
   }
   S.areaPrev = newPrev;
-  S.snd = { uid: uid.slice(), area, dadt, x: x.map(v => v / Ws), active: Array.from(area, (a, i) => !onwall[i] && a > 0 && !growing[i]), meanA };
+  S.snd = { uid: uid.slice(), area, dadt, x: x.map(v => v / Ws), active: Array.from(area, (a, i) => !onwall[i] && a > 0), meanA };   // TD left out inflating newborns; here they sing (they are what the finger makes)
   for (let i = 0; i < n; i++) if (dead[i]) S.popEvents.push([peakNow[i], x[i] / Ws, meanA]);
   if (S.popEvents.length > 256) S.popEvents.splice(0, S.popEvents.length - 256);
 
@@ -681,7 +682,8 @@ function sound(dtF) {
   const target = new Map();
   if (sel.length) {
     const sorted = sel.map(i => act[i]).sort((a, b) => a - b), ref = Math.max(sorted[sorted.length >> 1], 1e-6);
-    for (const i of sel) target.set(snd.uid[i], [Math.min(Math.max(act[i] / (2 * ref), 0), 1) ** 0.5, hz(pitch(r[i])), snd.x[i]]);
+    // growing bubbles at full level, shrinking ones quieter
+    for (const i of sel) target.set(snd.uid[i], [Math.min(Math.max(act[i] / (2 * ref), 0), 1) ** 0.5 * (snd.dadt[i] > 0 ? 1 : P.shrinkgain), hz(pitch(r[i])), snd.x[i]]);
   }
   const g = P.voicegain / Math.sqrt(Math.max(nv, 1)), lag = 1 - Math.exp(-dtF / 0.12);
   for (let i = 0; i < Math.max(nv, voices.length); i++) voice(i);
