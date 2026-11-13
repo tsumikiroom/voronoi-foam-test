@@ -61,9 +61,9 @@
 <script>
 'use strict';
 // Weighted Voronoi Foam — web port of the TouchDesigner patch 20260926_Foam.toe (/project1/S2_FOAM)
-// Sim: per-frame cell-id map on the GPU (curved power metric, read back), statistics + von
-// Neumann-Mullins coarsening + bubble mechanics on the CPU. Look: walls drawn at screen resolution
-// from the cell map's candidates (exact distance to the wall). Sound: Web Audio, same mapping as foam_audio.
+// Sim: per-frame cell-id map on the GPU (power diagram, read back), statistics + von
+// Neumann-Mullins coarsening + bubble mechanics on the CPU. Look: walls are quadratic arcs between
+// the junctions, sagging with the pressure difference (port of _arcs). Sound: Web Audio, same mapping as foam_audio.
 
 // ---------------- parameters (values saved in the .toe; others = TD defaults) ----------------
 const P = {
@@ -71,7 +71,7 @@ const P = {
   spawnrate: 30, spread: 0.9, inflate: 1.5, pressure: 0.6, cohesion: 1, damping: 5,
   contrast: 0.6, clusters: 8, clustersize: 0.4, clusterdrift: 0.03,
   simheight: 280,     // TD default 400; lowered for phones (the sim pace is normalized to 720 px)
-  linewidth: 3.57,
+  linewidth: 3.57, shortwall: 0.5, smooth: 0.25,
   sound: true, volume: 0.5, voices: 8, voicegain: 0.03, pitchlow: 45, pitchhigh: 84, scale: true,
   popgain: 0.7, popdecay: 0.08, poppitch: 12, width: 0.8,
 };
@@ -82,7 +82,7 @@ const LOOKS = {
 let look = 'night';
 const REF_ASPECT = 1200 / 1920;     // the TD output was 1200 x 1920 with 800 bubbles
 const MAXN = 1024;
-const COARSEN_K = 1400.0, CURVE_K = 0.3, FRONT_AGE = 4.0, INIT_FILL = 0.35;
+const COARSEN_K = 1400.0, FRONT_AGE = 4.0, INIT_FILL = 0.35;
 
 // ---------------- WebGL ----------------
 const canvas = document.getElementById('c');
@@ -94,7 +94,7 @@ const VS = `#version 300 es
 in vec2 aP; void main(){ gl_Position = vec4(aP, 0.0, 1.0); }`;
 const LABEL_FS = `#version 300 es
 precision highp float; precision highp int;
-uniform highp sampler2D uSeeds; uniform int uN; uniform float uK;
+uniform highp sampler2D uSeeds; uniform int uN;
 out vec4 o;
 void main(){
   vec2 x = gl_FragCoord.xy;
@@ -102,56 +102,37 @@ void main(){
   for (int i = 0; i < ${MAXN}; i++) {
     if (i >= uN) break;
     vec4 sd = texelFetch(uSeeds, ivec2(i, 0), 0);
-    vec2 d = x - sd.xy; float dl = length(d);
-    // dl^2 - 2k r dl = (dl - k r)^2 - (k r)^2; clamping dl - k r at 0 keeps f rising with distance,
-    // so a bubble never claims a ring around its own centre when Bulge is high
-    float e = max(dl - uK * sd.w, 0.0);
-    float f = e * e - sd.z + uK * sd.w * sd.w * (2.0 - uK);
+    vec2 d = x - sd.xy;
+    float f = dot(d, d) - sd.z;          // power distance (TD: the map is straight, only the drawn walls bend)
     if (f < best) { best = f; id = i; }
   }
   o = vec4(float(id & 255) / 255.0, float(id >> 8) / 255.0, 0.0, 1.0);
 }`;
-const LOOK_FS = `#version 300 es
-precision highp float; precision highp int;
-uniform highp sampler2D uSeeds; uniform highp sampler2D uLabel;
-uniform vec2 uSim; uniform vec2 uOut; uniform float uK;
-uniform float uW;           // line width (output px)
-uniform vec3 uLine, uBg;
-out vec4 o;
-#define MAXC 18
-int lab(ivec2 q){ vec4 t = texelFetch(uLabel, q, 0); return int(t.r * 255.0 + 0.5) + 256 * int(t.g * 255.0 + 0.5); }
+// walls: one quad per arc segment (instanced), coverage from the distance to the segment.
+// Blended with MAX (light lines) or MIN (dark lines) so overlapping joints do not double up.
+const LINE_VS = `#version 300 es
+in vec2 aC; in vec4 aSeg;
+uniform vec2 uScale; uniform vec2 uOut; uniform float uW;
+out vec2 vA; out vec2 vB;
 void main(){
-  vec2 uv = gl_FragCoord.xy / uOut;
-  vec2 x = uv * uSim;
-  float toOut = uOut.y / uSim.y;
-  ivec2 lr = ivec2(uSim); ivec2 c = ivec2(floor(x));
-  int ids[MAXC]; int n = 0;
-  for (int ring = 0; ring < 2; ring++) {
-    int stp = ring == 0 ? 1 : 4;
-    for (int dy = -1; dy <= 1; dy++) for (int dx = -1; dx <= 1; dx++) {
-      int id = lab(clamp(c + ivec2(dx, dy) * stp, ivec2(0), lr - 1));
-      bool seen = false;
-      for (int k = 0; k < MAXC; k++) { if (k >= n) break; if (ids[k] == id) seen = true; }
-      if (!seen && n < MAXC) { ids[n] = id; n++; }
-    }
-  }
-  float f1 = 1e30, f2 = 1e30; vec2 g1 = vec2(0), g2 = vec2(0);
-  for (int k = 0; k < MAXC; k++) {
-    if (k >= n) break;
-    vec4 sd = texelFetch(uSeeds, ivec2(ids[k], 0), 0);
-    vec2 d = x - sd.xy; float dl = max(length(d), 1e-4);
-    // dl^2 - 2k r dl = (dl - k r)^2 - (k r)^2; clamping dl - k r at 0 keeps f rising with distance,
-    // so a bubble never claims a ring around its own centre when Bulge is high
-    float e = max(dl - uK * sd.w, 0.0);
-    float f = e * e - sd.z + uK * sd.w * sd.w * (2.0 - uK);
-    vec2 g = d * (2.0 * e / dl);
-    if (f < f1) { f2 = f1; g2 = g1; f1 = f; g1 = g; }
-    else if (f < f2) { f2 = f; g2 = g; }
-  }
-  float d2 = n < 2 ? 1e4 : (f2 - f1) / max(length(g2 - g1), 1e-4) * toOut;
-  float hw = 0.5 * uW;
-  float line = 1.0 - smoothstep(hw - 0.7, hw + 0.7, d2);
-  o = vec4(mix(uBg, uLine, line), 1.0);
+  vec2 A = aSeg.xy * uScale, B = aSeg.zw * uScale;
+  vec2 v = B - A; float l = length(v); vec2 t = l > 1e-4 ? v / l : vec2(1.0, 0.0); vec2 nn = vec2(-t.y, t.x);
+  float r = 0.5 * uW + 1.0;
+  vec2 p = mix(A, B, aC.x) + t * (aC.x * 2.0 - 1.0) * r + nn * aC.y * r;
+  vA = A; vB = B;
+  gl_Position = vec4(p / uOut * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const LINE_FS = `#version 300 es
+precision highp float;
+in vec2 vA; in vec2 vB;
+uniform float uW; uniform vec3 uLine, uBg;
+out vec4 o;
+void main(){
+  vec2 p = gl_FragCoord.xy, v = vB - vA;
+  float h = clamp(dot(p - vA, v) / max(dot(v, v), 1e-6), 0.0, 1.0);
+  float d = length(p - vA - v * h), hw = 0.5 * uW;
+  float a = 1.0 - smoothstep(hw - 0.7, hw + 0.7, d);
+  o = vec4(mix(uBg, uLine, a), 1.0);
 }`;
 
 function compile(type, src) {
@@ -159,19 +140,28 @@ function compile(type, src) {
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fail('Shader error: ' + gl.getShaderInfoLog(s));
   return s;
 }
-function program(fs) {
+function program(fs, vs = VS) {
   const p = gl.createProgram();
-  gl.attachShader(p, compile(gl.VERTEX_SHADER, VS)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
-  gl.bindAttribLocation(p, 0, 'aP'); gl.linkProgram(p);
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, vs === VS ? 'aP' : 'aC'); if (vs !== VS) gl.bindAttribLocation(p, 1, 'aSeg');
+  gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fail('Link error: ' + gl.getProgramInfoLog(p));
   const u = {}; const nu = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
   for (let i = 0; i < nu; i++) { const a = gl.getActiveUniform(p, i); u[a.name.replace(/\[0\]$/, '')] = gl.getUniformLocation(p, a.name); }
   return { p, u };
 }
-const progLabel = program(LABEL_FS), progLook = program(LOOK_FS);
+const progLabel = program(LABEL_FS), progLine = program(LINE_FS, LINE_VS);
+const quadVao = gl.createVertexArray(); gl.bindVertexArray(quadVao);
 const quad = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, quad);
 gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
 gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const lineVao = gl.createVertexArray(); gl.bindVertexArray(lineVao);
+const corner = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, corner);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, -1, 1, -1, 1, 1, 0, -1, 1, 1, 0, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const segBuf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, segBuf);
+gl.enableVertexAttribArray(1); gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(1, 1);
+gl.bindVertexArray(null);
 
 const seedTex = gl.createTexture();
 gl.bindTexture(gl.TEXTURE_2D, seedTex);
@@ -179,7 +169,7 @@ gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, MAXN, 1, 0, gl.RGBA, gl.FLOAT, null)
 for (const k of [gl.TEXTURE_MIN_FILTER, gl.TEXTURE_MAG_FILTER]) gl.texParameteri(gl.TEXTURE_2D, k, gl.NEAREST);
 const seedBuf = new Float32Array(MAXN * 4);
 
-let labelTex = null, labelFbo = null, curveTex = null, curveFbo = null, labelPix = null, ids = null;
+let labelTex = null, labelFbo = null, labelPix = null, ids = null;
 function makeTarget(old) {
   if (old) { gl.deleteTexture(old[0]); gl.deleteFramebuffer(old[1]); }
   const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
@@ -192,9 +182,6 @@ function makeTarget(old) {
 }
 function makeLabelTarget() {
   [labelTex, labelFbo] = makeTarget(labelTex && [labelTex, labelFbo]);
-  // the walls bend with Bulge; their neighbour candidates must come from a map made with the same
-  // curved metric, or cells the straight map does not know about show up as broken arcs
-  [curveTex, curveFbo] = makeTarget(curveTex && [curveTex, curveFbo]);
   labelPix = new Uint8Array(Ws * Hs * 4); ids = new Uint16Array(Ws * Hs);
 }
 
@@ -422,6 +409,10 @@ function step(dtIn) {
     vx[i] = st.vx * 0.5; vy[i] = st.vy * 0.5;
   }
 
+  // wall arcs for drawing (this frame's topology)
+  const alpha = P.smooth <= 0 ? 1 : 1 - Math.exp(-dt / P.smooth);
+  S.seg = arcs(n, area, cx, cy, alpha);
+
   // pops: settled cells that became too small, plus tapped ones
   const dead = new Uint8Array(n); let ndead = 0;
   for (let i = 0; i < n; i++) {
@@ -491,6 +482,157 @@ function step(dtIn) {
   if (S.x.length > MAXN) for (const k of keys) S[k].length = MAXN;
   if (S.x.length === 0) { initSim(); return; }
   S.weff = S.w.map((wi, i) => { let t = Math.min(Math.max((clock - S.birth[i]) / inflate, 0), 1); t = t * t * (3 - 2 * t); return wi - S.D[i] * (1 - t); });
+}
+
+// ---------------- wall arcs (port of foam_sim._arcs) ----------------
+// Walls are quadratic arcs between shared nodes (triple junctions and frame-border points of the
+// cell map). Each wall sags by the pressure difference of its two bubbles (P = mean area / area),
+// so small bubbles bulge outward. Node positions and sags are smoothed over time.
+const ARC_STEPS = 8, ONLINE_TOL = 3.0, HOLD_FRAMES = 3, MERGE_TOL = 1.6, JUMP_TOL = 6.0, SAG_K = 0.087, SAG_MAX = 0.35;
+function smoothVals(slot, keys, vals, dim, alpha, jumpTest) {
+  // exponential smoothing against last frame's value with the same key; a jump >= JUMP_TOL snaps
+  const prev = S[slot], next = new Map();
+  for (let i = 0; i < keys.length; i++) {
+    const v = vals.subarray(i * dim, i * dim + dim), o = prev && alpha < 1 ? prev.get(keys[i]) : undefined;
+    if (o) {
+      let blend = true;
+      if (jumpTest) for (let k = 0; k < dim; k++) if (Math.abs(v[k] - o[k]) >= JUMP_TOL) blend = false;
+      if (blend) for (let k = 0; k < dim; k++) v[k] = o[k] + (v[k] - o[k]) * alpha;
+    }
+    next.set(keys[i], Float64Array.from(v));
+  }
+  S[slot] = next;
+}
+function mergeNodes(X, Y, tol) {
+  // near-4-way junctions show up as two triple nodes ~1 px apart: snap close nodes to their mean
+  const m = X.length; if (m < 2) return;
+  const par = new Int32Array(m); for (let i = 0; i < m; i++) par[i] = i;
+  const find = i => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+  const grid = new Map();
+  for (let i = 0; i < m; i++) {
+    const gx = Math.floor(X[i] / tol), gy = Math.floor(Y[i] / tol);
+    for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+      const l = grid.get((gx + dx) * 65536 + (gy + dy)); if (!l) continue;
+      for (const j of l) if ((X[i] - X[j]) ** 2 + (Y[i] - Y[j]) ** 2 < tol * tol) { const a = find(i), b = find(j); if (a !== b) par[a] = b; }
+    }
+    const key = gx * 65536 + gy; let l = grid.get(key); if (!l) grid.set(key, l = []); l.push(i);
+  }
+  const sx = new Float64Array(m), sy = new Float64Array(m), c = new Float64Array(m);
+  for (let i = 0; i < m; i++) { const r = find(i); sx[r] += X[i]; sy[r] += Y[i]; c[r]++; }
+  for (let i = 0; i < m; i++) { const r = find(i); X[i] = sx[r] / c[r]; Y[i] = sy[r] / c[r]; }
+}
+function arcs(n, area, cx, cy, alpha) {
+  const { x, y, uid } = S, weff = S.weff;
+  const NX = [], NY = [], RX = [], RY = [];   // smoothed / raw node positions
+  const ek = [], en = [];                     // (wall pair key i*n+j, node index) candidates
+  // triple junctions: 2x2 blocks of the map with 3 or 4 distinct cells
+  const jun = new Map(), q = [0, 0, 0, 0];
+  const addTri = (a, b, c, px, py) => {
+    const k = (a * n + b) * n + c, e = jun.get(k);
+    if (e) { e[3] += px; e[4] += py; e[5]++; } else jun.set(k, [a, b, c, px, py, 1]);
+  };
+  for (let r = 0; r < Hs - 1; r++) {
+    const o = r * Ws;
+    for (let c = 0; c < Ws - 1; c++) {
+      const a = ids[o + c], b = ids[o + c + 1], cc = ids[o + Ws + c], d = ids[o + Ws + c + 1];
+      if (a === b && a === cc && a === d) continue;
+      q[0] = a; q[1] = b; q[2] = cc; q[3] = d; q.sort((u, v) => u - v);
+      const dist = 1 + (q[1] !== q[0]) + (q[2] !== q[1]) + (q[3] !== q[2]);
+      if (dist === 3) addTri(q[0], q[1] !== q[0] ? q[1] : q[2], q[3], c + 1, r + 1);
+      else if (dist === 4) { addTri(q[0], q[1], q[2], c + 1, r + 1); addTri(q[1], q[2], q[3], c + 1, r + 1); }
+    }
+  }
+  const jkeys = [], jv = new Float64Array(jun.size * 2); let ji = 0;
+  for (const e of jun.values()) {
+    const px = e[3] / e[5], py = e[4] / e[5];
+    RX.push(px); RY.push(py); jv[ji * 2] = px; jv[ji * 2 + 1] = py;
+    const t = [uid[e[0]], uid[e[1]], uid[e[2]]].sort((u, v) => u - v);
+    jkeys.push(t[0] + ',' + t[1] + ',' + t[2]);
+    ek.push(e[0] * n + e[1], e[0] * n + e[2], e[1] * n + e[2]); en.push(ji, ji, ji);
+    ji++;
+  }
+  smoothVals('juncPrev', jkeys, jv, 2, alpha, true);
+  for (let i = 0; i < ji; i++) { NX.push(jv[i * 2]); NY.push(jv[i * 2 + 1]); }
+  // nodes where walls reach the frame border (smoothed along the border)
+  const bkeys = [], bvals = [];
+  const border = (side, len, at, fx, fy) => {
+    for (let k = 0; k < len - 1; k++) {
+      const a = at(k), b = at(k + 1); if (a === b) continue;
+      const lo = Math.min(a, b), hi = Math.max(a, b);
+      ek.push(lo * n + hi); en.push(ji + bkeys.length);
+      const ul = Math.min(uid[lo], uid[hi]), uh = Math.max(uid[lo], uid[hi]);
+      bkeys.push(ul + ',' + uh + ',' + side);
+      bvals.push(fx !== null ? fx : k + 1, fy !== null ? fy : k + 1);
+    }
+  };
+  border(0, Ws, k => ids[k], null, 0);
+  border(1, Ws, k => ids[(Hs - 1) * Ws + k], null, Hs);
+  border(2, Hs, k => ids[k * Ws], 0, null);
+  border(3, Hs, k => ids[k * Ws + Ws - 1], Ws, null);
+  const bv = Float64Array.from(bvals);
+  for (let i = 0; i < bkeys.length; i++) { RX.push(bv[i * 2]); RY.push(bv[i * 2 + 1]); }
+  smoothVals('borderPrev', bkeys, bv, 2, alpha, true);
+  for (let i = 0; i < bkeys.length; i++) { NX.push(bv[i * 2]); NY.push(bv[i * 2 + 1]); }
+  if (!ek.length) return new Float32Array(0);
+  mergeNodes(NX, NY, MERGE_TOL);
+
+  // keep end-point candidates that lie on the power bisector of their pair (pixel-level junction
+  // detection sometimes pairs cells that do not share the wall), then take the two extreme ones
+  // along the wall as its ends
+  const walls = new Map();     // pair key -> [minS, nodeMin, maxS, nodeMax, count]
+  for (let e = 0; e < ek.length; e++) {
+    const i = (ek[e] / n) | 0, j = ek[e] % n, ex = RX[en[e]], ey = RY[en[e]];
+    const dxp = x[j] - x[i], dyp = y[j] - y[i], dd = Math.hypot(dxp, dyp) + 1e-6, ux = dxp / dd, uy = dyp / dd;
+    const h = ((x[j] * x[j] + y[j] * y[j]) - (x[i] * x[i] + y[i] * y[i]) + weff[i] - weff[j]) / (2 * dd);
+    if (!(Math.abs(ex * ux + ey * uy - h) < ONLINE_TOL)) continue;
+    const sc = -ex * uy + ey * ux;
+    const w = walls.get(ek[e]);
+    if (!w) walls.set(ek[e], [sc, en[e], sc, en[e], 1]);
+    else { if (sc < w[0]) { w[0] = sc; w[1] = en[e]; } if (sc >= w[2]) { w[2] = sc; w[3] = en[e]; } w[4]++; }
+  }
+  let meanA = 0, nl = 0; for (let i = 0; i < n; i++) if (area[i] > 0) { meanA += area[i]; nl++; }
+  meanA = nl ? meanA / nl : 1;
+  const Ls2 = P.shortwall > 0 ? (P.shortwall * Math.sqrt(meanA)) ** 2 : 0;
+  const wkeys = [], sags = [], geo = [];
+  for (const [k, w] of walls) {
+    if (w[4] < 2) continue;
+    const wi = (k / n) | 0, wj = k % n;
+    const ax = NX[w[1]], ay = NY[w[1]], bx = NX[w[3]], by = NY[w[3]];
+    const ln = Math.hypot(bx - ax, by - ay); if (!(ln > 0.5)) continue;
+    const sw = uid[wi] > uid[wj], ci = sw ? wj : wi, cj = sw ? wi : wj;   // orient by persistent ids
+    const Pi = meanA / Math.max(area[ci], 1), Pj = meanA / Math.max(area[cj], 1);
+    let sag = Math.min(Math.max(P.bulge * SAG_K * (Pi - Pj), -SAG_MAX), SAG_MAX) * ln;
+    if (Ls2 > 0) sag *= ln * ln / (ln * ln + Ls2);          // short walls are flattened
+    let nx = (by - ay) / ln, ny = -(bx - ax) / ln;
+    if ((0.5 * (ax + bx) - cx[ci]) * nx + (0.5 * (ay + by) - cy[ci]) * ny < 0) { nx = -nx; ny = -ny; }   // outward from ci
+    wkeys.push(uid[ci] + ',' + uid[cj]); sags.push(sag); geo.push([ax, ay, bx, by, nx, ny]);
+  }
+  const sv = Float64Array.from(sags);
+  smoothVals('wallPrev', wkeys, sv, 1, alpha, false);
+  const cur = new Map();       // wall key (uid pair) -> [ax, ay, bx, by, sag, nx, ny, missed frames]
+  for (let i = 0; i < wkeys.length; i++) { const g = geo[i]; cur.set(wkeys[i], [g[0], g[1], g[2], g[3], sv[i], g[4], g[5], 0]); }
+  // hold walls drawn last frame but not detected now (pixel dropouts made them blink)
+  if (S.hold) {
+    const alive = new Set(uid);
+    for (const [k, v] of S.hold) {
+      if (cur.has(k) || v[7] >= HOLD_FRAMES) continue;
+      const c = k.indexOf(','), a = +k.slice(0, c), b = +k.slice(c + 1);
+      if (alive.has(a) && alive.has(b)) cur.set(k, v.slice(0, 7).concat(v[7] + 1));
+    }
+  }
+  S.hold = cur;
+  const out = new Float32Array(cur.size * ARC_STEPS * 4); let o = 0;
+  for (const v of cur.values()) {
+    const ax = v[0], ay = v[1], bx = v[2], by = v[3], sag = v[4], nx = v[5], ny = v[6];
+    const qx = 0.5 * (ax + bx) + nx * 2 * sag, qy = 0.5 * (ay + by) + ny * 2 * sag;
+    let px = ax, py = ay;
+    for (let s = 1; s <= ARC_STEPS; s++) {
+      const t = s / ARC_STEPS, u = 1 - t;
+      const X = u * u * ax + 2 * u * t * qx + t * t * bx, Y = u * u * ay + 2 * u * t * qy + t * t * by;
+      out[o++] = px; out[o++] = py; out[o++] = X; out[o++] = Y; px = X; py = Y;
+    }
+  }
+  return out;
 }
 
 // ---------------- sound (port of foam_audio) ----------------
@@ -606,35 +748,38 @@ function frame() {
 }
 function tick(dtF) {
   if (!S || S.dims[0] !== Ws || S.dims[1] !== Hs) initSim();
-  const n = uploadSeeds(), k = P.bulge * CURVE_K;
+  const n = uploadSeeds();
 
-  // 1. cell-id map at sim resolution, read back for the statistics
+  // 1. cell-id map at sim resolution (straight power diagram), read back for the statistics
   gl.bindFramebuffer(gl.FRAMEBUFFER, labelFbo); gl.viewport(0, 0, Ws, Hs);
-  gl.useProgram(progLabel.p);
+  gl.disable(gl.BLEND);
+  gl.useProgram(progLabel.p); gl.bindVertexArray(quadVao);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, seedTex); gl.uniform1i(progLabel.u.uSeeds, 0);
-  gl.uniform1i(progLabel.u.uN, n); gl.uniform1f(progLabel.u.uK, 0);   // TD: label uses k = 0, only the walls bend
+  gl.uniform1i(progLabel.u.uN, n);
   gl.drawArrays(gl.TRIANGLES, 0, 3);
   gl.readPixels(0, 0, Ws, Hs, gl.RGBA, gl.UNSIGNED_BYTE, labelPix);
   for (let i = 0, j = 0; i < ids.length; i++, j += 4) ids[i] = labelPix[j] + (labelPix[j + 1] << 8);
-  // same map with the curved metric, only for drawing the walls
-  gl.bindFramebuffer(gl.FRAMEBUFFER, curveFbo);
-  gl.uniform1f(progLabel.u.uK, k);
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
 
-  // 2. walls at screen resolution
-  const Lk = LOOKS[look], sc = outH / 1920;
-  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, outW, outH);
-  gl.useProgram(progLook.p);
-  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, seedTex); gl.uniform1i(progLook.u.uSeeds, 0);
-  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, curveTex); gl.uniform1i(progLook.u.uLabel, 1);
-  gl.uniform2f(progLook.u.uSim, Ws, Hs); gl.uniform2f(progLook.u.uOut, outW, outH); gl.uniform1f(progLook.u.uK, k);
-  gl.uniform1f(progLook.u.uW, Math.max(P.linewidth * sc, 1));
-  gl.uniform3fv(progLook.u.uLine, Lk.line); gl.uniform3fv(progLook.u.uBg, Lk.bg);
-  gl.drawArrays(gl.TRIANGLES, 0, 3);
-
-  // 3. advance the sim with this frame's map, then the sound
+  // 2. advance the sim with this frame's map (this also builds the wall arcs), then the sound
   step(dtF);
   sound(dtF);
+
+  // 3. walls: the arcs drawn as lines at screen resolution (TD: render_arcs, line width in px at 1920 high)
+  const Lk = LOOKS[look], sc = outH / 1920;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, outW, outH);
+  gl.clearColor(Lk.bg[0], Lk.bg[1], Lk.bg[2], 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  const seg = S && S.seg;
+  if (seg && seg.length) {
+    const light = Lk.line[0] + Lk.line[1] + Lk.line[2] > Lk.bg[0] + Lk.bg[1] + Lk.bg[2];
+    gl.enable(gl.BLEND); gl.blendEquation(light ? gl.MAX : gl.MIN);
+    gl.useProgram(progLine.p); gl.bindVertexArray(lineVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, segBuf); gl.bufferData(gl.ARRAY_BUFFER, seg, gl.STREAM_DRAW);
+    gl.uniform2f(progLine.u.uScale, outW / Ws, outH / Hs); gl.uniform2f(progLine.u.uOut, outW, outH);
+    gl.uniform1f(progLine.u.uW, Math.max(P.linewidth * sc, 1));
+    gl.uniform3fv(progLine.u.uLine, Lk.line); gl.uniform3fv(progLine.u.uBg, Lk.bg);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, seg.length / 4);
+    gl.disable(gl.BLEND); gl.bindVertexArray(null);
+  }
 }
 
 // ---------------- UI ----------------
