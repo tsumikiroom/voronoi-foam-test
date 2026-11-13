@@ -40,7 +40,7 @@
 <canvas id="c"></canvas>
 <div id="title">
   <h1>Weighted Voronoi Foam</h1>
-  <div id="hint">tap: pop · hold: blow · drag: stir</div>
+  <div id="hint">tap: pop · hold / drag: make bubbles</div>
 </div>
 <div id="ui">
   <div id="panel" hidden>
@@ -206,12 +206,11 @@ let S = null;
 function rnd(a, b) { return a + Math.random() * (b - a); }
 function gauss() { let u = 0, v = 0; while (u === 0) u = Math.random(); v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
 
-function initSim() {
-  pins.clear();
-  const n = Math.max(Math.floor(P.count * INIT_FILL), 4);
+function initSim(empty = false) {
+  const n = empty ? 0 : Math.max(Math.floor(P.count * INIT_FILL), 4);
   const s0 = Math.sqrt(Ws * Hs / n / Math.PI);
   S = { x: [], y: [], w: [], s: [], birth: [], D: [], vx: [], vy: [], uid: [], weff: [],
-        clock: 0, acc: 0, dims: [Ws, Hs], pops: 0, born: 0, nextUid: n,
+        clock: 0, dims: [Ws, Hs], pops: 0, born: 0, nextUid: n,
         cent: null, cvel: null, peak: new Map(), areaPrev: new Map(), popEvents: [], snd: null };
   for (let i = 0; i < n; i++) {
     S.x.push(rnd(0, Ws)); S.y.push(rnd(0, Hs)); S.w.push(0); S.s.push(s0); S.birth.push(-1e9); S.D.push(0);
@@ -243,9 +242,7 @@ function field(x, y, sigma) {
 // ---------------- interaction ----------------
 const pointers = new Map();      // pointerId -> state
 const forcePop = new Set();      // uids popped by a tap
-const pins = new Map();          // uid -> pointer state (held bubble follows the finger)
-const HOLD_MS = 220, MOVE_TOL = 10;
-let pendingBlow = [];            // pointer states waiting for a bubble to be born
+const HOLD_MS = 220, MOVE_TOL = 10;   // a press that is held or moved makes bubbles; a short one pops
 
 function toSim(e) { return [e.clientX / innerWidth * Ws, (1 - e.clientY / innerHeight) * Hs]; }
 function uidAt(x, y) {
@@ -258,24 +255,19 @@ canvas.addEventListener('pointerdown', e => {
   try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
   startAudio(); hideHint();
   const [x, y] = toSim(e);
-  const st = { id: e.pointerId, x, y, x0: e.clientX, y0: e.clientY, t0: performance.now(), mode: 'press',
-               vx: 0, vy: 0, lt: performance.now(), uid: -1 };
-  st.timer = setTimeout(() => { if (st.mode === 'press') { st.mode = 'blow'; pendingBlow.push(st); } }, HOLD_MS);
+  const st = { id: e.pointerId, x, y, x0: e.clientX, y0: e.clientY, mode: 'press', acc: 1 };
+  st.timer = setTimeout(() => { if (st.mode === 'press') st.mode = 'spawn'; }, HOLD_MS);
   pointers.set(e.pointerId, st);
 });
 canvas.addEventListener('pointermove', e => {
   const st = pointers.get(e.pointerId); if (!st) return;
-  const [x, y] = toSim(e); const t = performance.now(); const dt = Math.max((t - st.lt) / 1000, 1e-3);
-  const a = Math.min(1, dt / 0.05);
-  st.vx += ((x - st.x) / dt - st.vx) * a; st.vy += ((y - st.y) / dt - st.vy) * a;
-  st.x = x; st.y = y; st.lt = t;
-  if (st.mode === 'press' && Math.hypot(e.clientX - st.x0, e.clientY - st.y0) > MOVE_TOL) { st.mode = 'stir'; clearTimeout(st.timer); }
+  [st.x, st.y] = toSim(e);
+  if (st.mode === 'press' && Math.hypot(e.clientX - st.x0, e.clientY - st.y0) > MOVE_TOL) { st.mode = 'spawn'; clearTimeout(st.timer); }
 });
 function endPointer(e) {
   const st = pointers.get(e.pointerId); if (!st) return;
   clearTimeout(st.timer);
   if (st.mode === 'press') { const u = uidAt(st.x, st.y); if (u >= 0) forcePop.add(u); }
-  if (st.uid >= 0) pins.delete(st.uid);
   st.mode = 'done'; pointers.delete(e.pointerId);
 }
 canvas.addEventListener('pointerup', endPointer);
@@ -285,12 +277,57 @@ canvas.addEventListener('contextmenu', e => e.preventDefault());    // long pres
 let hintTimer = setTimeout(hideHint, 9000);
 function hideHint() { document.getElementById('hint').classList.add('gone'); clearTimeout(hintTimer); }
 
+// ---------------- births from touches ----------------
+// While a finger is held or dragged, bubbles are born around it at Spawn rate: most next to a
+// recently born bubble near the finger (a spreading front, like the TD growth), the rest right
+// under the finger. With no touch nothing is born, and the foam only coarsens.
+function touchBirths(dt, nLive, birthAt, isFront, radius, x, y, n) {
+  let nfree = P.count - nLive;
+  const R = 0.15 * Hs;
+  for (const st of pointers.values()) {
+    if (st.mode !== 'spawn') continue;
+    st.acc += P.spawnrate * dt;
+    if (st.acc < 1) continue;
+    const front = [];
+    for (let i = 0; i < n; i++) if (isFront(i) && (x[i] - st.x) ** 2 + (y[i] - st.y) ** 2 < R * R) front.push(i);
+    while (st.acc >= 1) {
+      st.acc -= 1;
+      if (nfree <= 0) continue;
+      let q;
+      if (front.length && Math.random() < P.spread) {
+        const f = front[(Math.random() * front.length) | 0], r = radius(f) * rnd(1, 1.6), a = rnd(0, 2 * Math.PI);
+        q = [x[f] + Math.cos(a) * r, y[f] + Math.sin(a) * r];
+      } else q = [st.x + gauss() * 0.01 * Hs, st.y + gauss() * 0.01 * Hs];
+      if (birthAt(q[0], q[1]) >= 0) nfree--;
+    }
+  }
+}
+function emptyStep(dt, clock) {
+  // no bubbles (after Reset or when all popped): the first touch-born bubbles take the whole frame
+  S.seg = new Float32Array(0); S.mapUid = [];
+  S.snd = { uid: [], area: new Float64Array(0), dadt: new Float64Array(0), x: [], active: [], meanA: 1 };
+  const refA = Ws * Hs / Math.max(P.count, 1);
+  const born = [];
+  const birthAt = (qx, qy) => {
+    qx = Math.min(Math.max(qx, 0.5), Ws - 0.5); qy = Math.min(Math.max(qy, 0.5), Hs - 0.5);
+    const u = S.nextUid++; born.push([qx, qy, u]); S.born++; return u;
+  };
+  touchBirths(dt, 0, birthAt, () => false, () => 0, [], [], 0);
+  for (const b of born) {
+    S.x.push(b[0]); S.y.push(b[1]); S.w.push(0); S.s.push(0.5); S.birth.push(clock); S.D.push(refA / Math.PI * 1.2);
+    S.vx.push(0); S.vy.push(0); S.uid.push(b[2]);
+  }
+  const inflate = Math.max(P.inflate, 1e-3);
+  S.weff = S.w.map((wi, i) => { let t = Math.min(Math.max((clock - S.birth[i]) / inflate, 0), 1); t = t * t * (3 - 2 * t); return wi - S.D[i] * (1 - t); });
+}
+
 // ---------------- one simulation step (port of foam_sim.step) ----------------
 function step(dtIn) {
   if (!S || S.dims[0] !== Ws || S.dims[1] !== Hs) { initSim(); return; }
   const dt = Math.min(Math.max(dtIn, 0), 2 / 60);
   S.clock += dt; const clock = S.clock;
-  const n = S.x.length; if (n === 0) { initSim(); return; }
+  const n = S.x.length;
+  if (n === 0) { emptyStep(dt, clock); return; }
   const { x, y, w, s, birth, D, vx, vy, uid } = S;
   S.mapUid = uid.slice();
 
@@ -345,12 +382,6 @@ function step(dtIn) {
     sumA += dA[i]; na++;
   }
   if (na && K > 0) { const m = sumA / na; for (let i = 0; i < n; i++) if (active[i]) dw[i] = (dA[i] - m) / Math.max(gain[i], 1e-3); }
-  // held bubbles keep inflating (interaction): area grows by ~0.8 mean bubbles per second.
-  // gain is ~pi/2 for a settled cell but ~0 for a newborn, so it is floored at 1
-  for (const [u, st] of pins) {
-    const i = uid.indexOf(u); if (i < 0) continue;
-    if (area[i] < 0.15 * Ws * Hs) dw[i] += 0.8 * Math.max(meanA, refA) * dt / Math.max(gain[i], 1);
-  }
   let wm = 0;
   for (let i = 0; i < n; i++) {
     const st = area[i] > 0 ? Math.sqrt(safe[i] / Math.PI) : s[i];
@@ -382,17 +413,6 @@ function step(dtIn) {
     const m = Math.hypot(ax[i], ay[i]), sc = Math.min(1, amax / Math.max(m, 1e-6));
     vx[i] = (vx[i] + ax[i] * sc * dt) * damp; vy[i] = (vy[i] + ay[i] * sc * dt) * damp;
   }
-  // stirring (interaction): seeds near a dragging finger take on its velocity
-  const R = 0.12 * Hs;
-  for (const st of pointers.values()) {
-    if (st.mode !== 'stir') continue;
-    const k = Math.min(1, 10 * dt);
-    for (let i = 0; i < n; i++) {
-      const d2 = (x[i] - st.x) ** 2 + (y[i] - st.y) ** 2; if (d2 > 4 * R * R) continue;
-      const fo = Math.exp(-d2 / (R * R)) * k;
-      vx[i] += (st.vx - vx[i]) * fo; vy[i] += (st.vy - vy[i]) * fo;
-    }
-  }
   for (let i = 0; i < n; i++) {
     x[i] += vx[i] * dt; y[i] += vy[i] * dt;
     // keep each seed within half a radius of its centroid (else the cell vanishes = false pop)
@@ -402,13 +422,6 @@ function step(dtIn) {
     if (!(area[i] > 0)) { x[i] = ox0[i]; y[i] = oy0[i]; }
     x[i] = Math.min(Math.max(x[i], 0.5), Ws - 0.5); y[i] = Math.min(Math.max(y[i], 0.5), Hs - 0.5);
   }
-  // held bubbles follow the finger
-  for (const [u, st] of pins) {
-    const i = uid.indexOf(u); if (i < 0) continue;
-    x[i] = Math.min(Math.max(st.x, 0.5), Ws - 0.5); y[i] = Math.min(Math.max(st.y, 0.5), Hs - 0.5);
-    vx[i] = st.vx * 0.5; vy[i] = st.vy * 0.5;
-  }
-
   // wall arcs for drawing (this frame's topology)
   const alpha = P.smooth <= 0 ? 1 : 1 - Math.exp(-dt / P.smooth);
   S.seg = arcs(n, area, cx, cy, alpha);
@@ -417,7 +430,6 @@ function step(dtIn) {
   const dead = new Uint8Array(n); let ndead = 0;
   for (let i = 0; i < n; i++) {
     let d = area[i] < P.popsize * u2 && !growing[i];
-    if (pins.has(uid[i])) d = false;
     if (forcePop.has(uid[i])) d = true;
     if (d) { dead[i] = 1; ndead++; }
   }
@@ -438,7 +450,7 @@ function step(dtIn) {
   for (let i = 0; i < n; i++) if (dead[i]) S.popEvents.push([peakNow[i], x[i] / Ws, meanA]);
   if (S.popEvents.length > 256) S.popEvents.splice(0, S.popEvents.length - 256);
 
-  // growth: one bubble at a time next to a recently born one (spreading front)
+  // growth: only from touches (see touchBirths)
   const born = [];
   function birthAt(qx, qy) {
     qx = Math.min(Math.max(qx, 0.5), Ws - 0.5); qy = Math.min(Math.max(qy, 0.5), Hs - 0.5);
@@ -448,29 +460,7 @@ function step(dtIn) {
     born.push([qx, qy, w[h], 0.5, area[h] / Math.PI * 1.2, u]); S.born++;
     return u;
   }
-  for (const st of pendingBlow) { if (st.mode === 'blow') { const u = birthAt(st.x, st.y); if (u >= 0) { st.uid = u; pins.set(u, st); } } }
-  pendingBlow = [];
-  S.acc += P.spawnrate * dt;
-  let nfree = P.count - (n - ndead) - born.length;
-  const front = []; for (let i = 0; i < n; i++) if (age[i] < FRONT_AGE && area[i] > 0 && !dead[i]) front.push(i);
-  while (S.acc >= 1) {
-    S.acc -= 1;
-    if (nfree <= 0) continue;
-    let q = null;
-    if (front.length && Math.random() < P.spread) {
-      for (let t = 0; t < 4; t++) {
-        const p = front[(Math.random() * front.length) | 0];
-        const r = Math.sqrt(area[p] / Math.PI) * rnd(1, 1.6), a = rnd(0, 2 * Math.PI);
-        const cand = [x[p] + Math.cos(a) * r, y[p] + Math.sin(a) * r];
-        if (Math.random() <= (1 - contrast) + contrast * field(cand[0], cand[1], sigma)) { q = cand; break; }
-      }
-    }
-    if (!q) {
-      if (Math.random() < contrast) { const c0 = S.cent[(Math.random() * S.cent.length) | 0]; q = [c0[0] + gauss() * sigma * 0.5, c0[1] + gauss() * sigma * 0.5]; }
-      else q = [rnd(0, Ws), rnd(0, Hs)];
-    }
-    if (birthAt(q[0], q[1]) >= 0) nfree--;
-  }
+  touchBirths(dt, n - ndead, birthAt, i => age[i] < FRONT_AGE && area[i] > 0 && !dead[i], i => Math.sqrt(area[i] / Math.PI), x, y, n);
 
   // remove dead, append newborns
   const keys = ['x', 'y', 'w', 's', 'birth', 'D', 'vx', 'vy', 'uid'];
@@ -480,7 +470,6 @@ function step(dtIn) {
     S.vx.push(0); S.vy.push(0); S.uid.push(b[5]);
   }
   if (S.x.length > MAXN) for (const k of keys) S[k].length = MAXN;
-  if (S.x.length === 0) { initSim(); return; }
   S.weff = S.w.map((wi, i) => { let t = Math.min(Math.max((clock - S.birth[i]) / inflate, 0), 1); t = t * t * (3 - 2 * t); return wi - S.D[i] * (1 - t); });
 }
 
@@ -801,13 +790,13 @@ for (const [id, key, fmt] of sliders) {
 }
 document.getElementById('bSound').onclick = () => { P.sound = !P.sound; if (P.sound) startAudio(); else setBus(); syncUI(); };
 document.getElementById('bLook').onclick = () => { look = look === 'night' ? 'day' : 'night'; P.linewidth = LOOKS[look].linewidth; syncUI(); };
-document.getElementById('bReset').onclick = () => { S = null; pins.clear(); };
+document.getElementById('bReset').onclick = () => { if (S && S.dims[0] === Ws && S.dims[1] === Hs) initSim(true); else S = null; };   // clears every bubble
 document.getElementById('bPanel').onclick = e => { const p = document.getElementById('panel'); p.hidden = !p.hidden; e.target.classList.toggle('on', !p.hidden); };
 
 P.count = defaultCount();
 resize(); syncUI();
 addEventListener('resize', () => { resize(); });
-window.__foam = { tick, pins, P, get S() { return S; }, get fps() { return fps; }, get dims() { return [Ws, Hs, outW, outH]; } };
+window.__foam = { tick, pointers, P, get S() { return S; }, get fps() { return fps; }, get dims() { return [Ws, Hs, outW, outH]; } };
 requestAnimationFrame(frame);
 </script>
 </body>
