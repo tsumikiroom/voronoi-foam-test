@@ -2,62 +2,153 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Weighted Voronoi Foam</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#ffffff">
+<title>Voronoi Foam</title>
 <style>
-  :root { --fg: #fff; --bg: #000; --panel: rgba(0,0,0,0.72); --line: rgba(255,255,255,0.35); }
-  body.day { --fg: #1b2433; --bg: #e8edf5; --panel: rgba(255,255,255,0.8); --line: rgba(27,36,51,0.3); }
-  html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
-  body { font: 600 13px/1.3 "Helvetica Neue", Helvetica, Arial, sans-serif; color: var(--fg);
-         -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
-  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
-  #title { position: fixed; left: 16px; top: max(16px, env(safe-area-inset-top)); pointer-events: none; }
-  #title h1 { margin: 0; font-size: 15px; font-weight: 700; letter-spacing: 0.01em; }
-  #hint { margin-top: 4px; font-weight: 500; opacity: 0.7; transition: opacity 1.2s; }
-  #hint.gone { opacity: 0; }
-  #ui { position: fixed; right: 16px; bottom: max(16px, env(safe-area-inset-bottom)); display: flex;
-        flex-direction: column; align-items: flex-end; gap: 8px; }
-  .row { display: flex; gap: 6px; }
-  button { font: inherit; color: var(--fg); background: var(--panel); border: 1px solid var(--line);
-           border-radius: 999px; padding: 0 14px; height: 36px; min-width: 44px; cursor: pointer;
-           -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
-  button.on { background: var(--fg); color: var(--bg); }
-  #panel { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 6px 14px;
-           width: min(260px, calc(100vw - 32px)); box-sizing: border-box;
-           -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
-  #panel[hidden] { display: none; }
-  #panel label { display: flex; align-items: center; justify-content: space-between; gap: 10px; height: 40px;
-                 border-bottom: 1px solid var(--line); }
-  #panel label:last-child { border-bottom: 0; }
-  #panel label > b { width: 62px; font-weight: inherit; }
-  #panel span.v { width: 36px; text-align: right; font-weight: 500; opacity: 0.75; }
-  input[type=range] { flex: 1; accent-color: currentColor; height: 40px; margin: 0; }
-  #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
-         text-align: center; }
+/* Line-drawing UI (same idea as the other prototypes): white paper, 1px black lines, solid / dashed rules,
+   capsule shapes, bold plain grotesque type. */
+:root { --ink: #111; --paper: #fff; --line: 1px solid var(--ink); }
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+[hidden] { display: none !important; }
+html, body {
+  margin: 0; height: 100%; overflow: hidden; overscroll-behavior: none;
+  background: var(--paper); color: var(--ink); touch-action: none;
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  font: 500 15px/1.3 "Helvetica Neue", Helvetica, Arial, system-ui, sans-serif; letter-spacing: -.01em;
+}
+body.night { background: #000; }
+canvas { position: fixed; inset: 0; display: block; width: 100vw; height: 100vh; height: 100dvh; touch-action: none; }
+button {
+  font: inherit; color: var(--ink); background: var(--paper); cursor: pointer; touch-action: manipulation;
+  border: var(--line); border-radius: 999px; min-height: 44px; padding: 0 14px;
+}
+button.on { background: var(--ink); color: var(--paper); }
+.small { font-size: 12px; font-weight: 700; }
+/* ---- start sheet ---- */
+#start {
+  position: fixed; inset: 0; overflow-y: auto; touch-action: pan-y; background: var(--paper);
+  padding: calc(env(safe-area-inset-top, 0px) + 12px) 12px calc(env(safe-area-inset-bottom, 0px) + 12px);
+}
+.sheet {
+  min-height: 100%; display: flex; flex-direction: column; gap: 18px;
+  border: var(--line); border-radius: 22px; padding: 16px 18px 18px;
+}
+.meta { display: flex; justify-content: space-between; gap: 12px; }
+.sheet h1 { margin: auto 0 0; font-size: 60px; line-height: .88; font-weight: 700; letter-spacing: -.045em; }
+.diagram { display: block; width: 100%; height: auto; overflow: visible; }
+.diagram text { font: 700 11px "Helvetica Neue", Helvetica, Arial, sans-serif; fill: var(--ink); }
+.sheet p { margin: 0; max-width: 30em; }
+.choose { display: grid; gap: 8px; }
+.choose button {
+  min-height: 60px; padding: 0 22px; display: flex; justify-content: space-between; align-items: center;
+  font-size: 18px; font-weight: 700; letter-spacing: -.02em;
+}
+.choose button:active { background: var(--ink); color: var(--paper); }
+#err { padding: 12px 14px; border: 1px dashed var(--ink); border-radius: 14px; white-space: pre-line; background: var(--paper); }
+#err::before { content: "Error"; display: block; margin-bottom: 4px; font-size: 12px; font-weight: 700; }
+.sheet .foot { margin-top: auto; padding-top: 12px; border-top: 1px dashed var(--ink); }
+/* ---- message over the foam ---- */
+#hint {
+  position: fixed; left: 50%; bottom: calc(env(safe-area-inset-bottom, 0px) + 28px); transform: translateX(-50%);
+  width: max-content; max-width: calc(100% - 32px); padding: 8px 16px;
+  background: var(--paper); border: var(--line); border-radius: 18px;
+  font-size: 14px; font-weight: 700; text-align: center; pointer-events: none; transition: opacity .6s;
+}
+#hint.gone { opacity: 0; }
+/* ---- control card ---- */
+#dock {
+  position: fixed; padding: 8px;
+  left: max(8px, env(safe-area-inset-left, 0px)); right: max(8px, env(safe-area-inset-right, 0px));
+  top: calc(env(safe-area-inset-top, 0px) + 8px);
+  background: var(--paper); border: var(--line); border-radius: 22px;
+}
+.bar { display: flex; gap: 6px; align-items: center; }
+.bar button { flex: 1; padding: 0 6px; font-size: 14px; font-weight: 700; }
+.seg { flex: 2; display: flex; border: var(--line); border-radius: 999px; overflow: hidden; }
+.seg button { border: 0; border-radius: 0; min-height: 42px; }
+.seg button + button { border-left: var(--line); }
+#fold { flex: 0 0 44px; padding: 0; display: grid; place-items: center; }
+#fold svg { transition: transform .2s; }
+#dock.folded #fold svg { transform: rotate(180deg); }
+.knobs {
+  margin-top: 8px; padding: 0 6px; border-top: 1px solid var(--ink);
+  max-height: calc(100dvh - 160px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+  overflow-y: auto; touch-action: pan-y;
+}
+#dock.folded .knobs { display: none; }
+.knob {
+  display: grid; grid-template-columns: 5.6em 1fr 4.2em; gap: 10px; align-items: center; min-height: 44px;
+  font-size: 15px; font-weight: 700; letter-spacing: -.01em;
+}
+.knob + .knob { border-top: 1px solid var(--ink); }
+.knob output { text-align: right; font-variant-numeric: tabular-nums; }
+/* slider = a hairline ruler with tick marks and a ringed dot */
+input[type=range] {
+  --tick: 10%;
+  -webkit-appearance: none; appearance: none; width: 100%; height: 44px; margin: 0; background:
+    linear-gradient(var(--ink), var(--ink)) center / calc(100% - 16px) 1px no-repeat,
+    repeating-linear-gradient(90deg, var(--ink) 0 1px, transparent 1px var(--tick)) center / calc(100% - 16px) 7px no-repeat,
+    linear-gradient(var(--ink), var(--ink)) right 8px center / 1px 7px no-repeat;
+}
+input[type=range]:focus { outline: none; }
+input[type=range]::-webkit-slider-runnable-track { height: 44px; background: transparent; }
+input[type=range]::-moz-range-track { height: 44px; background: transparent; }
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 16px; height: 16px; margin-top: 14px; border-radius: 50%;
+  background: var(--ink); border: var(--line); box-shadow: inset 0 0 0 3px var(--paper);
+}
+input[type=range]::-moz-range-thumb {
+  width: 16px; height: 16px; border-radius: 50%; box-sizing: border-box;
+  background: var(--ink); border: var(--line); box-shadow: inset 0 0 0 3px var(--paper);
+}
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
-<div id="title">
-  <h1>Weighted Voronoi Foam</h1>
-  <div id="hint">tap: pop · hold / drag: make bubbles</div>
-</div>
-<div id="ui">
-  <div id="panel" hidden>
-    <label><b>Bubbles</b> <input id="sCount" type="range" min="50" max="1000" step="10"><span class="v" id="vCount"></span></label>
-    <label><b>Coarsen</b> <input id="sCoarsen" type="range" min="0" max="8" step="0.1"><span class="v" id="vCoarsen"></span></label>
-    <label><b>Bulge</b> <input id="sBulge" type="range" min="0" max="2" step="0.01"><span class="v" id="vBulge"></span></label>
-    <label><b>Line</b> <input id="sLine" type="range" min="0.5" max="8" step="0.05"><span class="v" id="vLine"></span></label>
-    <label><b>Volume</b> <input id="sVolume" type="range" min="0" max="1" step="0.01"><span class="v" id="vVolume"></span></label>
+<div id="hint" hidden>Hold or drag to make bubbles · tap one to pop it</div>
+<div id="start">
+  <div class="sheet">
+    <div class="meta small"><span>No. 1</span><span>Foam / Touch / Sound</span></div>
+    <h1>Voronoi<br>Foam.</h1>
+    <svg class="diagram" viewBox="0 0 320 190" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1">
+      <!-- foam grown from a finger: small bubbles at the touch, bigger ones further out; a tapped bubble pops -->
+      <circle cx="160" cy="92" r="7" />
+      <circle cx="176" cy="92" r="8.5" /><circle cx="168" cy="106" r="8.5" /><circle cx="152" cy="106" r="8.5" />
+      <circle cx="144" cy="92" r="8.5" /><circle cx="152" cy="78" r="8.5" /><circle cx="168" cy="78" r="8.5" />
+      <circle cx="196" cy="102" r="13" /><circle cx="181" cy="121" r="13" /><circle cx="155" cy="127" r="13" />
+      <circle cx="132" cy="116" r="13" /><circle cx="122" cy="94" r="13" /><circle cx="130" cy="71" r="13" />
+      <circle cx="152" cy="58" r="13" /><circle cx="177" cy="61" r="13" /><circle cx="195" cy="78" r="13" />
+      <circle cx="267" cy="98" r="24" /><circle cx="228" cy="141" r="24" /><circle cx="53" cy="86" r="24" />
+      <circle cx="92" cy="43" r="24" /><circle cx="243" cy="52" r="24" />
+      <circle cx="160" cy="92" r="2" fill="currentColor" stroke="none" />
+      <path d="M160 92 V12" stroke-dasharray="4 4" />
+      <text x="166" y="14" stroke="none">hold / drag</text>
+      <circle cx="78" cy="140" r="12" stroke-dasharray="3 3" />
+      <path d="M64 126 L59 121 M92 126 L97 121 M64 154 L59 159 M92 154 L97 159" />
+      <text x="78" y="182" text-anchor="middle" stroke="none">tap: pop</text>
+      <text x="290" y="152" text-anchor="middle" stroke="none">grows</text>
+    </svg>
+    <p>Hold or drag your finger to grow foam from that spot. Bubbles with many neighbours swell and swallow the small ones, and each change in size is heard as a tone. Tap a bubble to pop it.</p>
+    <div class="choose">
+      <button id="go"><span>Start with sound</span><span aria-hidden="true">&rarr;</span></button>
+    </div>
+    <div id="err" hidden></div>
+    <div class="meta small foot"><span>Runs on this device</span><span>WebGL2</span></div>
   </div>
-  <div class="row">
+</div>
+<div id="dock" class="folded" hidden>
+  <div class="bar">
+    <div class="seg">
+      <button data-look="day">Day</button>
+      <button data-look="night">Night</button>
+    </div>
     <button id="bSound" class="on">Sound</button>
-    <button id="bLook">Day</button>
     <button id="bReset">Reset</button>
-    <button id="bPanel">Edit</button>
+    <button id="fold" aria-label="Show controls" aria-expanded="false"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path d="M3 10l5-5 5 5" fill="none" stroke="currentColor" stroke-width="1.2"/></svg></button>
   </div>
+  <div class="knobs" id="knobs"></div>
 </div>
-<div id="err"></div>
 <script>
 'use strict';
 // Weighted Voronoi Foam — web port of the TouchDesigner patch 20260926_Foam.toe (/project1/S2_FOAM)
@@ -71,24 +162,27 @@ const P = {
   spawnrate: 30, spread: 0.9, inflate: 1.5, pressure: 0.6, cohesion: 1, damping: 5,
   contrast: 0.6, clusters: 8, clustersize: 0.4, clusterdrift: 0.03,
   simheight: 280,     // TD default 400; lowered for phones (the sim pace is normalized to 720 px)
-  linewidth: 3.57, shortwall: 0.5, smooth: 0.25,
+  linewidth: 3.2, shortwall: 0.5, smooth: 0.25,   // Day line (Night: 3.57 as saved in the .toe)
   // TD Voicegain 0.03; raised x4 so the growing bubbles alone carry the piece. shrinkgain: level of shrinking ones
   sound: true, volume: 0.5, voices: 8, voicegain: 0.12, shrinkgain: 0.35, pitchlow: 45, pitchhigh: 84, scale: true,
   popgain: 0.7, popdecay: 0.08, poppitch: 12, width: 0.8,
 };
 const LOOKS = {
   night: { line: [1, 1, 1], bg: [0, 0, 0], linewidth: 3.57 },
-  day: { line: [0.16, 0.22, 0.31], bg: [0.94, 0.96, 0.99], linewidth: 1.6 },
+  day: { line: [0.067, 0.067, 0.067], bg: [1, 1, 1], linewidth: 3.2 },
 };
-let look = 'night';
+let look = 'day';
 const REF_ASPECT = 1200 / 1920;     // the TD output was 1200 x 1920 with 800 bubbles
 const MAXN = 1024;
-const COARSEN_K = 1400.0, FRONT_AGE = 4.0, INIT_FILL = 0.35;
+const COARSEN_K = 1400.0, FRONT_AGE = 4.0;
 
 // ---------------- WebGL ----------------
 const canvas = document.getElementById('c');
 const gl = canvas.getContext('webgl2', { antialias: false, premultipliedAlpha: false });
-function fail(msg) { const e = document.getElementById('err'); e.textContent = msg; e.style.display = 'flex'; throw new Error(msg); }
+function fail(msg) {
+  document.getElementById('start').hidden = false; document.querySelector('.choose').hidden = true;
+  const e = document.getElementById('err'); e.hidden = false; e.textContent = msg; throw new Error(msg);
+}
 if (!gl) fail('This page needs WebGL2.');
 
 const VS = `#version 300 es
@@ -207,9 +301,9 @@ let S = null;
 function rnd(a, b) { return a + Math.random() * (b - a); }
 function gauss() { let u = 0, v = 0; while (u === 0) u = Math.random(); v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
 
-function initSim(empty = false) {
-  const n = empty ? 0 : Math.max(Math.floor(P.count * INIT_FILL), 4);
-  const s0 = Math.sqrt(Ws * Hs / n / Math.PI);
+function initSim() {
+  // the foam starts empty: every bubble comes from a touch
+  const n = 0, s0 = 1;
   S = { x: [], y: [], w: [], s: [], birth: [], D: [], vx: [], vy: [], uid: [], weff: [],
         clock: 0, dims: [Ws, Hs], pops: 0, born: 0, nextUid: n,
         cent: null, cvel: null, peak: new Map(), areaPrev: new Map(), popEvents: [], snd: null };
@@ -275,7 +369,7 @@ canvas.addEventListener('pointerup', endPointer);
 canvas.addEventListener('pointercancel', endPointer);
 canvas.addEventListener('lostpointercapture', endPointer);
 canvas.addEventListener('contextmenu', e => e.preventDefault());    // long press would open a menu
-let hintTimer = setTimeout(hideHint, 9000);
+let hintTimer = 0;
 function hideHint() { document.getElementById('hint').classList.add('gone'); clearTimeout(hintTimer); }
 
 // ---------------- births from touches ----------------
@@ -774,26 +868,33 @@ function tick(dtF) {
 }
 
 // ---------------- UI ----------------
-const sliders = [['Count', 'count', v => v | 0], ['Coarsen', 'coarsen', v => v.toFixed(1)], ['Bulge', 'bulge', v => v.toFixed(2)],
-                 ['Line', 'linewidth', v => v.toFixed(1)], ['Volume', 'volume', v => v.toFixed(2)]];
+const sliders = [['Bubbles', 'count', 50, 1000, 10, v => v | 0], ['Coarsen', 'coarsen', 0, 8, 0.1, v => v.toFixed(1)],
+                 ['Bulge', 'bulge', 0, 2, 0.01, v => v.toFixed(2)], ['Line', 'linewidth', 0.5, 8, 0.05, v => v.toFixed(1)],
+                 ['Volume', 'volume', 0, 1, 0.01, v => v.toFixed(2)]];
+const knobs = document.getElementById('knobs'), outs = {};
+for (const [label, key, min, max, stepv, fmt] of sliders) {
+  const row = document.createElement('label'); row.className = 'knob';
+  row.innerHTML = `<span>${label}</span><input type="range" min="${min}" max="${max}" step="${stepv}"><output></output>`;
+  const inp = row.querySelector('input'), out = row.querySelector('output');
+  inp.addEventListener('input', () => { P[key] = parseFloat(inp.value); out.textContent = fmt(P[key]); if (key === 'volume') setBus(); });
+  outs[key] = [inp, out, fmt]; knobs.appendChild(row);
+}
 function syncUI() {
-  for (const [id, key, fmt] of sliders) {
-    document.getElementById('s' + id).value = P[key]; document.getElementById('v' + id).textContent = fmt(P[key]);
-  }
+  for (const key in outs) { const [inp, out, fmt] = outs[key]; inp.value = P[key]; out.textContent = fmt(P[key]); }
   document.getElementById('bSound').classList.toggle('on', P.sound);
-  document.getElementById('bLook').textContent = look === 'night' ? 'Day' : 'Night';
-  document.body.classList.toggle('day', look === 'day');
+  for (const b of document.querySelectorAll('[data-look]')) b.classList.toggle('on', b.dataset.look === look);
+  document.body.classList.toggle('night', look === 'night');
 }
-for (const [id, key, fmt] of sliders) {
-  document.getElementById('s' + id).addEventListener('input', e => {
-    P[key] = parseFloat(e.target.value); document.getElementById('v' + id).textContent = fmt(P[key]);
-    if (key === 'volume') setBus();
-  });
-}
+for (const b of document.querySelectorAll('[data-look]')) b.onclick = () => { look = b.dataset.look; P.linewidth = LOOKS[look].linewidth; syncUI(); };
 document.getElementById('bSound').onclick = () => { P.sound = !P.sound; if (P.sound) startAudio(); else setBus(); syncUI(); };
-document.getElementById('bLook').onclick = () => { look = look === 'night' ? 'day' : 'night'; P.linewidth = LOOKS[look].linewidth; syncUI(); };
-document.getElementById('bReset').onclick = () => { if (S && S.dims[0] === Ws && S.dims[1] === Hs) initSim(true); else S = null; };   // clears every bubble
-document.getElementById('bPanel').onclick = e => { const p = document.getElementById('panel'); p.hidden = !p.hidden; e.target.classList.toggle('on', !p.hidden); };
+document.getElementById('bReset').onclick = () => { if (S && S.dims[0] === Ws && S.dims[1] === Hs) initSim(); else S = null; };   // clears every bubble
+const dock = document.getElementById('dock'), fold = document.getElementById('fold');
+fold.onclick = () => { const f = dock.classList.toggle('folded'); fold.setAttribute('aria-expanded', String(!f)); fold.setAttribute('aria-label', f ? 'Show controls' : 'Hide controls'); };
+document.getElementById('go').addEventListener('click', () => {
+  document.getElementById('start').hidden = true; dock.hidden = false;
+  const h = document.getElementById('hint'); h.hidden = false; hintTimer = setTimeout(hideHint, 12000);
+  startAudio();
+});
 
 P.count = defaultCount();
 resize(); syncUI();
